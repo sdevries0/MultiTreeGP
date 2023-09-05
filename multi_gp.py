@@ -222,7 +222,6 @@ class ODE_GP:
             # return self.environment.diffusion(t, x, args)
             return jnp.concatenate([self.environment.diffusion(t, x, u), jnp.zeros((self.state_size, 2))])
         
-        # solver = diffrax.ReversibleHeun()
         solver = diffrax.Tsit5()
         dt0 = 0.1
         saveat = diffrax.SaveAt(ts=ts)
