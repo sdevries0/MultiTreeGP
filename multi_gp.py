@@ -79,13 +79,13 @@ class ODE_GP:
         self.mod_prob = self.mod_prob.at[self.modifications.index("sample_tree")].set(1)
         self.mod_prob = self.mod_prob.at[self.modifications.index("sample_subtree")].set(1)
         self.mod_prob = self.mod_prob.at[self.modifications.index("simplify_tree")].set(0.5)
-        # self.mod_prob = self.mod_prob.at[self.modifications.index("mutate_operator")].set(0.47)
-        # self.mod_prob = self.mod_prob.at[self.modifications.index("mutate_constant")].set(0.048)
-        # self.mod_prob = self.mod_prob.at[self.modifications.index("delete_operator")].set(1.7)
-        # self.mod_prob = self.mod_prob.at[self.modifications.index("insert_operator")].set(5.1)
-        # self.mod_prob = self.mod_prob.at[self.modifications.index("mutate_leaf")].set(0.1)
-        # self.mod_prob = self.mod_prob.at[self.modifications.index("prepend_operator")].set(0.4)
-        # self.mod_prob = self.mod_prob.at[self.modifications.index("add_subtree")].set(0.4)
+        self.mod_prob = self.mod_prob.at[self.modifications.index("mutate_operator")].set(0.5)
+        self.mod_prob = self.mod_prob.at[self.modifications.index("mutate_constant")].set(0.5)
+        self.mod_prob = self.mod_prob.at[self.modifications.index("delete_operator")].set(0.5)
+        self.mod_prob = self.mod_prob.at[self.modifications.index("insert_operator")].set(0.5)
+        self.mod_prob = self.mod_prob.at[self.modifications.index("mutate_leaf")].set(0.5)
+        self.mod_prob = self.mod_prob.at[self.modifications.index("prepend_operator")].set(0.5)
+        self.mod_prob = self.mod_prob.at[self.modifications.index("add_subtree")].set(0.5)
         
         #Define parameters that may be included in solutions
         self.obs_size = environment.n_obs
@@ -461,11 +461,13 @@ class ODE_GP:
             return jnp.clip(fitness,0,1e5)
     
     #Insert an operator at a random point in tree. Sample a new leaf if necessary to satisfy arity of the operator
-    def insert_operator(self, tree):
-        if len(tree())==1:
+    def insert_operator(self, trees):
+        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
+        tree = trees()[tree_index]
+        if len(tree)==1:
             return tree, True
         leaves = jax.tree_util.tree_leaves(tree)
-        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree())
+        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
         operator_indices = jnp.ravel(jnp.argwhere(jnp.array([self._operator(leaf) for leaf in leaves])))
         index = jrandom.choice(self.keyGen.get(), operator_indices)
         path = flat_tree_and_path[index][0][:-1]
@@ -481,16 +483,18 @@ class ODE_GP:
             other_leaf = self.sample_leaf()
 
             new_tree = [new_operator, subtree, other_leaf] if (tree_position == 0) else [new_operator, other_leaf, subtree]
-        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, new_tree), False
+        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, new_tree), False
     
     #Replace a leaf with a new subtree
-    def add_subtree(self, tree):
+    def add_subtree(self, trees):
+        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
+        tree = trees()[tree_index]
         leaves = jax.tree_util.tree_leaves(tree)
-        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree())
+        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
         leaf_indices = jnp.ravel(jnp.argwhere(jnp.array([self._leaf(leaf) for leaf in leaves])))
         index = jrandom.choice(self.keyGen.get(), leaf_indices)
         path = flat_tree_and_path[index][0][:-1]
-        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, self.full_node(depth=2))
+        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, self.full_node(depth=2))
     
     #Change an operator into a different operator of equal arity
     def mutate_operator(self, trees):
@@ -519,56 +523,64 @@ class ODE_GP:
         return eqx.tree_at(lambda t: t()[tree_index], trees, new_tree), False
 
     #Add an operator to the top of the tree
-    def prepend_operator(self, tree):
+    def prepend_operator(self, trees):
+        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
+        tree = trees()[tree_index]
         if jrandom.uniform(self.keyGen.get())>0.6:
             new_operator = self.unary_operators[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(self.unary_operators))]
-            new_tree = [new_operator, tree()]
+            new_tree = [new_operator, tree]
         else:
             new_operator = self.binary_operators[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(self.binary_operators))]
             tree_position = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=2)
             #Sample a leaf for the other child of the operator
             other_leaf = self.sample_leaf()
 
-            new_tree = [new_operator, tree(), other_leaf] if (tree_position == 0) else [new_operator, other_leaf, tree()]
-        return eqx.tree_at(lambda t: t(), tree, new_tree)
+            new_tree = [new_operator, tree, other_leaf] if (tree_position == 0) else [new_operator, other_leaf, tree]
+        return eqx.tree_at(lambda t: t()[tree_index], trees, new_tree)
 
     #Change value of a leaf. Leaf can stay the same type of change to the other leaf type
-    def mutate_leaf(self, tree):
+    def mutate_leaf(self, trees):
+        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
+        tree = trees()[tree_index]
         leaves = jax.tree_util.tree_leaves(tree)
-        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree())
+        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
         leaf_indices = jnp.ravel(jnp.argwhere(jnp.array([self._leaf(leaf) for leaf in leaves])))
         index = jrandom.choice(self.keyGen.get(), leaf_indices)
         path = flat_tree_and_path[index][0][:-1]
         new_leaf = self.sample_leaf(sd=3)
-        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, new_leaf)
+        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, new_leaf)
     
     #Change the value of a constant leaf. The value is sampled around the old value
-    def mutate_constant(self, tree):
+    def mutate_constant(self, trees):
+        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
+        tree = trees()[tree_index]
         leaves = jax.tree_util.tree_leaves(tree)
         if sum([self._constant(leaf) for leaf in leaves]) == 0:
             return tree, True
         constant_indicies = jnp.ravel(jnp.argwhere(jnp.array([self._constant(leaf) for leaf in leaves])))
         index = jrandom.choice(self.keyGen.get(), constant_indicies)
-        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree())
+        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
         value = flat_tree_and_path[index][1]
         path = flat_tree_and_path[index][0]
         #Sample around the old value, with a temperature controlling the variance
-        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, value+self.temperature*jrandom.normal(self.keyGen.get())), False
+        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, value+self.temperature*jrandom.normal(self.keyGen.get())), False
     
     #Replace an operator with a new leaf
-    def delete_operator(self, tree):
+    def delete_operator(self, trees):
+        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
+        tree = trees()[tree_index]
         #If tree does not contain operators, return as failed mutation
-        if len(tree())==1:
+        if len(tree)==1:
             return tree, True
             
         new_leaf = self.sample_leaf(sd=3)
         leaves = jax.tree_util.tree_leaves(tree)
         operator_indicies = jnp.ravel(jnp.argwhere(jnp.array([self._operator(leaf) for leaf in leaves])))
-        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree())
+        flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
         index = jrandom.choice(self.keyGen.get(), operator_indicies)
         path = flat_tree_and_path[index][0][:-1]
 
-        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, new_leaf), False
+        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, new_leaf), False
     
     #Selects individuals that will replace randomly selected indivuals in a receiver distribution
     def migrate_trees(self, sender, receiver):
