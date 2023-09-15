@@ -7,6 +7,7 @@ import diffrax
 import treelib
 import matplotlib.pyplot as plt
 import time
+from pathos.multiprocessing import ProcessingPool as Pool
 
 class KeyGen:
     def __init__(self, seed = 0):
@@ -60,8 +61,8 @@ register_pytree_node(Expression, lambda tree: ((tree.expression,), None),
     lambda _, args: Expression(*args))
 
 class ODE_GP:
-    def __init__(self, environment, fitness_function, state_size, control_size, tournament_size = 4, selection_pressure = 0.9, max_depth=10, max_init_depth=5, population_size=100, num_populations=1, migration_period=4, migration_percentage=0.1, migration_method="ring", init_method="ramped"):
-        self.keyGen = KeyGen(0)
+    def __init__(self, seed, environment, fitness_function, state_size, control_size, tournament_size = 7, selection_pressure = 0.9, max_depth=10, max_init_depth=5, population_size=100, num_populations=1, migration_period=4, migration_percentage=0.1, migration_method="ring", init_method="ramped"):
+        self.keyGen = KeyGen(seed)
         self.environment = environment
         self.fitness_function = fitness_function
 
@@ -72,23 +73,28 @@ class ODE_GP:
         self.unary_operators = list(self.unary_operators_map.keys())
 
         #Define modification types
-        self.modifications = ["reproduction","cross_over","mutate_operator","delete_operator","insert_operator","mutate_constant","mutate_leaf","sample_tree","sample_subtree","prepend_operator","add_subtree","simplify_tree"]
-        self.mod_prob = jnp.ones(len(self.modifications))*0
-        self.mod_prob = self.mod_prob.at[self.modifications.index("cross_over")].set(6.5)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("reproduction")].set(1)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("sample_tree")].set(1)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("sample_subtree")].set(1)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("simplify_tree")].set(0.5)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("mutate_operator")].set(0.5)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("mutate_constant")].set(0.5)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("delete_operator")].set(0.5)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("insert_operator")].set(0.5)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("mutate_leaf")].set(0.5)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("prepend_operator")].set(0.5)
-        self.mod_prob = self.mod_prob.at[self.modifications.index("add_subtree")].set(0.5)
+        self.mutations = ["mutate_operator","delete_operator","insert_operator","mutate_constant","mutate_leaf","sample_subtree","prepend_operator","add_subtree","simplify_tree"]
+        self.mod_prob = jnp.ones(len(self.mutations))
+        # self.mod_prob = self.mod_prob.at[self.mutations.index("reproduction")].set(0)
+        # self.mod_prob = self.mod_prob.at[self.mutations.index("sample_subtree")].set(1)
+        self.mod_prob = self.mod_prob.at[self.mutations.index("simplify_tree")].set(0)
+        # self.mod_prob = self.mod_prob.at[self.mutations.index("mutate_operator")].set(0.5)
+        # self.mod_prob = self.mod_prob.at[self.mutations.index("mutate_constant")].set(0.5)
+        # self.mod_prob = self.mod_prob.at[self.mutations.index("delete_operator")].set(0.5)
+        # self.mod_prob = self.mod_prob.at[self.mutations.index("insert_operator")].set(0.5)
+        # self.mod_prob = self.mod_prob.at[self.mutations.index("mutate_leaf")].set(0.5)
+        # self.mod_prob = self.mod_prob.at[self.mutations.index("prepend_operator")].set(0.5)
+        # self.mod_prob = self.mod_prob.at[self.mutations.index("add_subtree")].set(0.5)
+
+        self.cross_over_prob = 0.55
+        self.mutation_prob = 0.3
+        self.sample_prob = 0.1
+        self.reproduction_prob = 0.05
+        self.tree_mutate_prob = 0.5
         
         #Define parameters that may be included in solutions
         self.obs_size = environment.n_obs
+        self.latent_size = environment.n_var
         self.state_size = state_size
         self.variables = ["x" + str(i) for i in range(self.obs_size)]
         self.state_variables = ["a" + str(i) for i in range(self.state_size)]
@@ -98,8 +104,6 @@ class ODE_GP:
         self.tournament_size = tournament_size
         self.tournament_probabilities = jnp.array([selection_pressure*(1-selection_pressure)**n for n in jnp.arange(self.tournament_size)])
         self.tournament_indices = jnp.arange(self.tournament_size)
-        self.temperature = 1
-        self.temperature_decay = 0.9
         self.parsimony_punishment = 0.1
         self.max_depth = max_depth
         self.max_init_depth = max_init_depth
@@ -185,57 +189,68 @@ class ODE_GP:
                 
         return tree
     
-    #Computes the outcome of the expression. Assumses that variables are given values
     def evaluate_tree(self, tree):
         if tree[0] in self.binary_operators:
             assert len(tree) == 3, f"The operator {tree[0]} requires two inputs"
-            return self.binary_operators_map[tree[0]](self.evaluate_tree(tree[1]),self.evaluate_tree(tree[2]))
+            left = self.evaluate_tree(tree[1])
+            right = self.evaluate_tree(tree[2])
+            return lambda x, a, t: self.binary_operators_map[tree[0]](left(x,a,t),right(x,a,t))
         
         elif tree[0] in self.unary_operators:
             assert len(tree) == 2, f"The operator {tree[0]} requires one input"
-            return self.unary_operators_map[tree[0]](self.evaluate_tree(tree[1]))
-    
+            left = self.evaluate_tree(tree[1])
+            return lambda x, a, t: self.unary_operators_map[tree[0]](left(x,a,t))
+
         assert len(tree) == 1, "Leaves should not have children"
-        return tree[0]
+        if isinstance(tree[0],jax.numpy.ndarray):
+            return lambda x, a, t: tree[0]
+        elif tree[0]=="target":
+            return lambda x, a, t: t
+        elif tree[0] in self.state_variables:
+            return lambda x, a, t: a[self.state_variables.index(tree[0])]
+        elif tree[0] in self.variables:
+            return lambda x, a, t: x[self.variables.index(tree[0])]
     
     def evaluate_expression(self, expression):
-        return jnp.array([self.evaluate_tree(tree) for tree in expression()])
+        return [self.evaluate_tree(tree) for tree in expression()]
     
     #Solves the coupled differential equation of the state and the control. The differential equation of the state is defined in the environment and the differential equation of the control is defined by a tree.
     def evaluate_control_loop(self, tree, x0, ts, target, key):
+        tree_funcs = self.evaluate_expression(tree)
+        state_equation = jax.jit(lambda y, a, tar: jnp.array([tree_funcs[i](y, a, tar) for i in range(self.state_size)]))
+
         #Define state equation
         def _drift(t, x_a, args):
-            x = x_a[:self.obs_size]
-            a = x_a[self.obs_size:]
+            x = x_a[:self.latent_size]
+            a = x_a[self.latent_size:]
             u = a[:self.control_size]
             #Get environment update
             dx, y = self.environment.drift(t, x, u)
-            sol_tree = self.fill_variables(tree, y, a, target)
-            da = self.evaluate_expression(sol_tree)
+            da = state_equation(y, a, target)
             return jnp.concatenate([dx, da])
         
         #Define diffusion
         def _diffusion(t, x_a, args):
-            x = x_a[:self.obs_size]
-            a = x_a[self.obs_size:]
+            x = x_a[:self.latent_size]
+            a = x_a[self.latent_size:]
             u = a[:self.control_size]
             # return self.environment.diffusion(t, x, args)
-            return jnp.concatenate([self.environment.diffusion(t, x, u), jnp.zeros((self.state_size, 2))])
+            return jnp.concatenate([self.environment.diffusion(t, x, u), jnp.zeros((self.state_size, 1))])
         
-        solver = diffrax.Tsit5()
+        solver = diffrax.Euler()
         dt0 = 0.1
         saveat = diffrax.SaveAt(ts=ts)
         _x0 = jnp.concatenate([x0, jnp.zeros(self.state_size)])
 
-        brownian_motion = diffrax.VirtualBrownianTree(ts[0], ts[-1], tol=1e-1, shape=(2,), key=key)
+        brownian_motion = diffrax.UnsafeBrownianPath(shape=(1,), key=key)
         system = diffrax.MultiTerm(diffrax.ODETerm(_drift), diffrax.ControlTerm(_diffusion, brownian_motion))    
         # system = diffrax.ODETerm(_drift)    
 
         sol = diffrax.diffeqsolve(
-            system, solver, ts[0], ts[-1], dt0, _x0, saveat=saveat#, stepsize_controller=diffrax.PIDController(rtol=1e-3, atol=1e-6)
+            system, solver, ts[0], ts[-1], dt0, _x0, saveat=saveat, adjoint=diffrax.DirectAdjoint()
         )
-        ys = sol.ys[:,:self.obs_size]
-        activities = sol.ys[:,self.obs_size:]
+        ys = sol.ys[:,:self.latent_size]
+        activities = sol.ys[:,self.latent_size:]
         us = activities[:,:self.control_size]
         return ys, us, activities
     
@@ -384,10 +399,6 @@ class ODE_GP:
             return populations[0][0]
         
         return populations
-        
-    def sample_subtree(self, trees, max_depth = 3):
-        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
-        return eqx.tree_at(lambda t: t()[tree_index], trees, self.full_node(max_depth))
 
     #Return the subtree from a random node onwards
     def get_subtree(self, tree):
@@ -461,20 +472,16 @@ class ODE_GP:
             return jnp.clip(fitness,0,1e5)
     
     #Insert an operator at a random point in tree. Sample a new leaf if necessary to satisfy arity of the operator
-    def insert_operator(self, trees):
-        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
-        tree = trees()[tree_index]
-        if len(tree)==1:
-            return tree, True
-        leaves = jax.tree_util.tree_leaves(tree)
+    def insert_operator(self, tree):
+        nodes = jax.tree_util.tree_leaves(tree)
         flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
-        operator_indices = jnp.ravel(jnp.argwhere(jnp.array([self._operator(leaf) for leaf in leaves])))
+        operator_indices = jnp.ravel(jnp.argwhere(jnp.array([self._operator(node) for node in nodes])))
         index = jrandom.choice(self.keyGen.get(), operator_indices)
         path = flat_tree_and_path[index][0][:-1]
         subtree = self._key_loc(tree, path)
         
         operator_type = jrandom.uniform(self.keyGen.get())
-        if operator_type>0.6: #unary operator
+        if operator_type>0.75: #unary operator
             new_operator = self.unary_operators[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(self.unary_operators))]
             new_tree = [new_operator, subtree]
         else: #binary operator
@@ -483,28 +490,21 @@ class ODE_GP:
             other_leaf = self.sample_leaf()
 
             new_tree = [new_operator, subtree, other_leaf] if (tree_position == 0) else [new_operator, other_leaf, subtree]
-        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, new_tree), False
+        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, new_tree)
     
     #Replace a leaf with a new subtree
-    def add_subtree(self, trees):
-        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
-        tree = trees()[tree_index]
-        leaves = jax.tree_util.tree_leaves(tree)
+    def add_subtree(self, tree):
+        nodes = jax.tree_util.tree_leaves(tree)
         flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
-        leaf_indices = jnp.ravel(jnp.argwhere(jnp.array([self._leaf(leaf) for leaf in leaves])))
+        leaf_indices = jnp.ravel(jnp.argwhere(jnp.array([self._leaf(node) for node in nodes])))
         index = jrandom.choice(self.keyGen.get(), leaf_indices)
         path = flat_tree_and_path[index][0][:-1]
-        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, self.full_node(depth=2))
+        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, self.grow_node(depth=3))
     
     #Change an operator into a different operator of equal arity
-    def mutate_operator(self, trees):
-        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
-        tree = trees()[tree_index]
-        #If tree does not contain operators, return as failed mutation
-        if len(tree)==1:
-            return tree, True
-        leaves = jax.tree_util.tree_leaves(tree)
-        operator_indicies = jnp.ravel(jnp.argwhere(jnp.array([self._operator(leaf) for leaf in leaves])))
+    def mutate_operator(self, tree):
+        nodes = jax.tree_util.tree_leaves(tree)
+        operator_indicies = jnp.ravel(jnp.argwhere(jnp.array([self._operator(node) for node in nodes])))
         flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
         index = jrandom.choice(self.keyGen.get(), operator_indicies)
         symbol = flat_tree_and_path[index][1]
@@ -520,13 +520,11 @@ class ODE_GP:
             un_copy.remove(symbol)
             new_operator = un_copy[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(un_copy))]
             new_tree = eqx.tree_at(lambda t: self._key_loc(t, path), tree, new_operator)
-        return eqx.tree_at(lambda t: t()[tree_index], trees, new_tree), False
+        return eqx.tree_at(lambda t: t, tree, new_tree)
 
     #Add an operator to the top of the tree
-    def prepend_operator(self, trees):
-        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
-        tree = trees()[tree_index]
-        if jrandom.uniform(self.keyGen.get())>0.6:
+    def prepend_operator(self, tree):
+        if jrandom.uniform(self.keyGen.get())>0.75:
             new_operator = self.unary_operators[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(self.unary_operators))]
             new_tree = [new_operator, tree]
         else:
@@ -536,51 +534,43 @@ class ODE_GP:
             other_leaf = self.sample_leaf()
 
             new_tree = [new_operator, tree, other_leaf] if (tree_position == 0) else [new_operator, other_leaf, tree]
-        return eqx.tree_at(lambda t: t()[tree_index], trees, new_tree)
+        return eqx.tree_at(lambda t: t, tree, new_tree)
 
     #Change value of a leaf. Leaf can stay the same type of change to the other leaf type
-    def mutate_leaf(self, trees):
-        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
-        tree = trees()[tree_index]
-        leaves = jax.tree_util.tree_leaves(tree)
+    def mutate_leaf(self, tree):
+        nodes = jax.tree_util.tree_leaves(tree)
         flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
-        leaf_indices = jnp.ravel(jnp.argwhere(jnp.array([self._leaf(leaf) for leaf in leaves])))
+        leaf_indices = jnp.ravel(jnp.argwhere(jnp.array([self._leaf(node) for node in nodes])))
         index = jrandom.choice(self.keyGen.get(), leaf_indices)
+        new_leaf = [nodes[index]]
+        while new_leaf == [nodes[index]]:
+            index = jrandom.choice(self.keyGen.get(), leaf_indices)
+            new_leaf = self.sample_leaf(sd=3)
         path = flat_tree_and_path[index][0][:-1]
-        new_leaf = self.sample_leaf(sd=3)
-        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, new_leaf)
+        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, new_leaf)
     
     #Change the value of a constant leaf. The value is sampled around the old value
-    def mutate_constant(self, trees):
-        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
-        tree = trees()[tree_index]
-        leaves = jax.tree_util.tree_leaves(tree)
-        if sum([self._constant(leaf) for leaf in leaves]) == 0:
-            return tree, True
-        constant_indicies = jnp.ravel(jnp.argwhere(jnp.array([self._constant(leaf) for leaf in leaves])))
+    def mutate_constant(self, tree):
+        nodes = jax.tree_util.tree_leaves(tree)
+
+        constant_indicies = jnp.ravel(jnp.argwhere(jnp.array([self._constant(node) for node in nodes])))
         index = jrandom.choice(self.keyGen.get(), constant_indicies)
         flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
         value = flat_tree_and_path[index][1]
         path = flat_tree_and_path[index][0]
-        #Sample around the old value, with a temperature controlling the variance
-        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, value+self.temperature*jrandom.normal(self.keyGen.get())), False
+        #Sample around the old value
+        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, value+jrandom.normal(self.keyGen.get()))
     
     #Replace an operator with a new leaf
-    def delete_operator(self, trees):
-        tree_index = jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=self.state_size)
-        tree = trees()[tree_index]
-        #If tree does not contain operators, return as failed mutation
-        if len(tree)==1:
-            return tree, True
-            
+    def delete_operator(self, tree):
         new_leaf = self.sample_leaf(sd=3)
-        leaves = jax.tree_util.tree_leaves(tree)
-        operator_indicies = jnp.ravel(jnp.argwhere(jnp.array([self._operator(leaf) for leaf in leaves])))
+        nodes = jax.tree_util.tree_leaves(tree)
+        operator_indicies = jnp.ravel(jnp.argwhere(jnp.array([self._operator(node) for node in nodes])))
         flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
         index = jrandom.choice(self.keyGen.get(), operator_indicies)
         path = flat_tree_and_path[index][0][:-1]
 
-        return eqx.tree_at(lambda t: self._key_loc(t()[tree_index], path), trees, new_leaf), False
+        return eqx.tree_at(lambda t: self._key_loc(t, path), tree, new_leaf)
     
     #Selects individuals that will replace randomly selected indivuals in a receiver distribution
     def migrate_trees(self, sender, receiver):
@@ -624,28 +614,91 @@ class ODE_GP:
 
         return populations
 
-    #Generate new trees from the old generation. Trees with better fitness have a bigger chance to reproduce
-    def next_population(self, population):
-        remaining_candidates = len(population)-1
+    def mutate_tree(self, tree, allow_simplification=True):
+        mod_prob = self.mod_prob.copy()
+
+        if len(tree)==1:
+            mod_prob = mod_prob.at[self.mutations.index("mutate_operator")].set(0)
+            mod_prob = mod_prob.at[self.mutations.index("delete_operator")].set(0)
+            mod_prob = mod_prob.at[self.mutations.index("insert_operator")].set(0)
+        if sum([self._constant(node) for node in jax.tree_util.tree_leaves(tree)]) == 0:
+            mod_prob = mod_prob.at[self.mutations.index("mutate_constant")].set(0)
+        if not allow_simplification:
+            mod_prob = mod_prob.at[self.mutations.index("simplify_tree")].set(0)
+
+        mutation_type = self.mutations[jrandom.choice(self.keyGen.get(), jnp.arange(len(self.mutations)), shape=(), p=mod_prob)]
+        if mutation_type=="mutate_operator":
+            new_tree = self.mutate_operator(tree)
+        elif mutation_type=="delete_operator":
+            new_tree = self.delete_operator(tree)
+        elif mutation_type=="prepend_operator":
+            new_tree = self.prepend_operator(tree)
+        elif mutation_type=="insert_operator":
+            new_tree = self.insert_operator(tree)
+        elif mutation_type=="mutate_constant":
+            new_tree = self.mutate_constant(tree)
+        elif mutation_type=="mutate_leaf":
+            new_tree = self.mutate_leaf(tree)
+        elif mutation_type=="sample_subtree":
+            new_tree = self.grow_node(depth=3)
+        elif mutation_type=="add_subtree":
+            new_tree = self.add_subtree(tree)
+        elif mutation_type=="simplify_tree":
+            simplified_tree, _ = self.simplify_tree(tree)
+            if eqx.tree_equal(tree, simplified_tree):
+                new_tree = self.mutate_tree(tree, allow_simplification=False)
+            else:
+                new_tree = simplified_tree
+        if (self._tree_depth(new_tree) > self.max_depth):
+            new_tree = self.mutate_tree(tree)
+        return new_tree
+
+    def similarity(self, tree_a, tree_b):
+        #beide leaves
+        if len(tree_a)==1 and len(tree_b)==1:
+            if isinstance(tree_a[0], jax.numpy.ndarray) and isinstance(tree_b, jax.numpy.ndarray):
+                return 1
+            if tree_a==tree_b:
+                return 1
+        if len(tree_a)==1 or len(tree_b)==1:
+            return 0
+        if len(tree_a) != len(tree_b):
+            return 0
+        if len(tree_a) == 2:
+            return int(tree_a[0] == tree_b[0]) + self.similarity(tree_a[1], tree_b[1])
+        return int(tree_a[0] == tree_b[0]) + max(self.similarity(tree_a[1], tree_b[1]) + self.similarity(tree_a[2], tree_b[2]), self.similarity(tree_a[1], tree_b[2]) + self.similarity(tree_a[2], tree_b[1]))
+
+    def similarities(self, tree_a, tree_b):
+        similarity = 0
+        for i in range(self.state_size):
+            similarity += self.similarity(tree_a()[i],tree_b()[i])/min(len(jax.tree_util.tree_leaves(tree_a()[i])),len(jax.tree_util.tree_leaves(tree_b()[i])))
+        return similarity/self.state_size
+
+    def next_population(self, population, mean_fitness):
+        remaining_candidates = len(population)
         #Keep best candidate in new population
-        best_candidate = sorted(population, key=lambda x: x.fitness, reverse=False)[0]
-        new_pop = [best_candidate]
+        new_pop = []
         failed_mutations = 0
 
         #Loop until new population has reached the desired size
         while remaining_candidates>0:
-            #If only one spot is left, do not choose cross-over
-            if remaining_candidates > 1:
-                #Sample modification to be applied on a tree
-                modification_type = self.modifications[jrandom.choice(self.keyGen.get(), jnp.arange(len(self.modifications)), shape=(), p=self.mod_prob)]
-            else:
-                #Sample modification to be applied on a tree, but crossover is not allowed
-                mod_prob_copy = self.mod_prob.at[self.modifications.index("cross_over")].set(0)
-                modification_type = self.modifications[jrandom.choice(self.keyGen.get(), jnp.arange(len(self.modifications)), shape=(), p=mod_prob_copy)]
-    
-            if modification_type=="cross_over":
-                tree_a = self.tournament_selection(population)
-                tree_b = self.tournament_selection(population)
+            probs = [self.cross_over_prob, self.mutation_prob, self.sample_prob, self.reproduction_prob]
+            tree_a = self.tournament_selection(population)
+            tree_b = self.tournament_selection(population)
+
+            similarity = self.similarities(tree_a, tree_b)
+            if tree_a.fitness > mean_fitness and tree_b.fitness > mean_fitness:
+                probs = [0,0.5,0.5,0]
+
+            elif similarity > 0.5:
+                # print(similarity)
+                probs = [0,0.6,0.3,0.1]
+            # if remaining_candidates==1:
+            #     action = jrandom.choice(self.keyGen.get(), jnp.arange(1,4), p=jnp.array([self.mutation_prob, self.sample_prob, self.reproduction_prob]))
+            # else:
+            action = jrandom.choice(self.keyGen.get(), jnp.arange(4), p=jnp.array(probs))
+            if action==0:
+                
 
                 #only apply uniform cross-over when there is more than one point of intersection
                 # if len(tree_a()) == len(tree_b()):
@@ -671,46 +724,44 @@ class ODE_GP:
                     new_pop.append(new_tree_a)
                     new_pop.append(new_tree_b)
                     remaining_candidates -= 2
-            else:
-                #Mutate a single tree to produce one new tree. Some mutations can fail
-                trees = self.tournament_selection(population)
-                failed = False
-                if modification_type=="reproduction":
-                    new_trees = trees   
-                elif modification_type=="mutate_operator":
-                    new_trees, failed = self.mutate_operator(trees)
-                elif modification_type=="delete_operator":
-                    new_trees, failed = self.delete_operator(trees)
-                elif modification_type=="prepend_operator":
-                    new_trees = self.prepend_operator(trees)
-                elif modification_type=="insert_operator":
-                    new_trees, failed = self.insert_operator(trees)
-                elif modification_type=="mutate_constant":
-                    new_trees, failed = self.mutate_constant(trees)
-                elif modification_type=="mutate_leaf":
-                    new_trees = self.mutate_leaf(trees)
-                elif modification_type=="sample_tree":
-                    new_trees = self.sample_trees(init_method="full")
-                elif modification_type=="sample_subtree":
-                    new_trees = self.sample_subtree(trees)
-                elif modification_type=="add_subtree":
-                    new_trees = self.add_subtree(trees)
-                elif modification_type=="simplify_tree":
-                    simplified_tree, _ = self.simplify_tree(trees())
-                    new_trees = eqx.tree_at(lambda t: t(), trees, simplified_tree)
-                    if eqx.tree_equal(trees, new_trees):
-                        failed = True
-                if (self._tree_depth(new_trees) > self.max_depth) or failed:
-                    failed_mutations += 1
-                else:
-                    #Add new tree to the new generation
-                    remaining_candidates -= 1
-                    new_pop.append(new_trees)
-        
-        #Decrease the temperature used for controlling the variance of mutating new constants
-        self.temperature = self.temperature * self.temperature_decay
+
+            elif action==1:
+                mutate_bool = jrandom.randint(self.keyGen.get(), shape=(self.state_size,), minval=0, maxval=2)
+                while jnp.sum(mutate_bool)==0:
+                    mutate_bool = jrandom.randint(self.keyGen.get(), shape=(self.state_size,), minval=0, maxval=2)
+                new_tree_a = tree_a
+                for i in range(self.state_size):
+                    if mutate_bool[i]==1:
+                        new_tree = self.mutate_tree(tree_a()[i])
+                        new_tree_a = eqx.tree_at(lambda t: t()[i], new_tree_a, new_tree)
+                new_pop.append(new_tree_a)
+
+                mutate_bool = jrandom.randint(self.keyGen.get(), shape=(self.state_size,), minval=0, maxval=2)
+                while jnp.sum(mutate_bool)==0:
+                    mutate_bool = jrandom.randint(self.keyGen.get(), shape=(self.state_size,), minval=0, maxval=2)
+                new_tree_b = tree_b
+                for i in range(self.state_size):
+                    if mutate_bool[i]==1:
+                        new_tree = self.mutate_tree(tree_b()[i])
+                        new_tree_b = eqx.tree_at(lambda t: t()[i], new_tree_b, new_tree)
+                new_pop.append(new_tree_b)
+                remaining_candidates -= 2
+
+            elif action==2:
+                new_trees = self.sample_trees(max_depth=3, N=2, init_method="full")[0]
+                #Add new tree to the new generation
+                remaining_candidates -= 2
+                new_pop.append(new_trees[0])
+                new_pop.append(new_trees[1])
+            elif action==3:
+                remaining_candidates -= 2
+                new_pop.append(tree_a)
+                new_pop.append(tree_b)
+
+        best_candidate = sorted(population, key=lambda x: x.fitness, reverse=False)[0]
+        new_pop[0] = best_candidate
         return new_pop
-    
+
     #Returns the type of the root of a tree
     def get_root(self, tree):
         root = tree()[0]
@@ -781,9 +832,15 @@ class ODE_GP:
                 best_fitness = jnp.min(fitnesses[pop])
                 best_solution = populations[pop][jnp.argmin(fitnesses[pop])]
         return best_solution
+    
+    def flatten(self, populations):
+        return [candidate for population in populations for candidate in population]
 
     #Runs the GP algorithm for a given number of runs and generations. It is possible to continue on a previous population or start from a new population.
-    def run(self, data, n_trials, num_generations, plot_statistics = False, continue_population=None, converge_value=0):
+    def run(self, data, n_trials, num_generations, pool_size, plot_statistics = False, continue_population=None, converge_value=0):
+        pool = Pool(pool_size)
+        pool.close()
+
         best_fitnesses = jnp.zeros((n_trials, num_generations))
         best_solutions = []
         y0, ts, targets = data
@@ -797,14 +854,30 @@ class ODE_GP:
                 populations = continue_population
             
             for g in range(num_generations):
-                fitnesses = jnp.zeros((self.num_populations, self.population_size))
+                pool.restart()
+                fitness = pool.amap(lambda x: self.get_fitness(x,y0,ts,targets,keys),self.flatten(populations))
+                pool.close()
+                pool.join()
+                tries = 0
+                while not fitness.ready():
+                    time.sleep(1)
+                    tries += 1
+
+                    if tries >= 200:
+                        print("TIMEOUT")
+                        break
+
+                fitnesses = jnp.reshape(jnp.array(fitness.get()),(self.num_populations,self.population_size))
+                # fitnesses = []
                 for pop in range(self.num_populations):
                     population = populations[pop]
                     for candidate in range(self.population_size):
-                        #Get fitness of a candidate
-                        fitness = self.get_fitness(population[candidate], y0, ts, targets, keys)
-                        population[candidate].set_fitness(fitness)
-                        fitnesses = fitnesses.at[pop, candidate].set(fitness)
+                        # fitness = self.get_fitness(population[candidate],y0,ts,targets,keys)
+                        # fitnesses.append(fitness)
+                        # population[candidate].set_fitness(fitness)
+                        population[candidate].set_fitness(fitnesses[pop,candidate])
+                # fitnesses = jnp.reshape(jnp.array(fitnesses),(self.num_populations,self.population_size))
+                    
                 #Get fitness of best solution of all populations without regularisation
                 best_fitnesses = best_fitnesses.at[r, g].set(self.get_fitness(self._best_solution(populations, fitnesses), y0, ts, targets, keys, add_regularization=False))
 
@@ -829,7 +902,7 @@ class ODE_GP:
                     
                     for pop in range(self.num_populations):
                         #Perform operations to generate new population
-                        populations[pop] = self.next_population(populations[pop])
+                        populations[pop] = self.next_population(populations[pop], jnp.mean(jnp.array([candidate.fitness for candidate in populations[pop]])))
                 else:
                     best_solution = self._best_solution(populations, fitnesses)
                     best_solutions.append(best_solution)
