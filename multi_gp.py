@@ -67,7 +67,6 @@ class NetworkTrees:
             return str(tree[0])
     
     def __str__(self):
-        print("to_string is used")
         return f"{[self._to_string(tree) for tree in self.hidden_state_trees]}, readout = {self._to_string(self.readout_tree)}"
     
 #Register the class of trees as a pytree
@@ -75,7 +74,7 @@ register_pytree_node(NetworkTrees, lambda tree: ((tree.hidden_state_trees,tree.r
     lambda _, args: NetworkTrees(*args))
 
 class ODE_GP:
-    def __init__(self, seed: int, state_size: int, tournament_size: int = 5, max_depth:int = 10, max_init_depth: int = 5, population_size: int = 100, num_populations: int = 1, migration_period: int = 5, migration_percentage: float = 0.1, migration_method: str = "ring", init_method: str = "ramped", similarity_threshold: float = 0.2, parsimony_punishment:int = 0.1, restart_iter_threshold: int = 8):
+    def __init__(self, seed: int, state_size: int, tournament_size: int = 5, max_depth:int = 10, max_init_depth: int = 5, population_size: int = 100, num_populations: int = 1, migration_period: int = 5, migration_percentage: float = 0.1, migration_method: str = "ring", init_method: str = "ramped", similarity_threshold: float = 0.2, parsimony_punishment:int = 0.1, restart_iter_threshold: Sequence[int] = jnp.array([15, 10, 8, 5]), cross_over_probs: Sequence[float] = jnp.ones(3)/3):
         """
         Genetic Programming algorithm to learn continuous-time controllers. Each candidate consists of a set of trees that represent the hidden state of a network and a tree that maps the hidden state to a control force. To generate a new population cross-over, mutation, reproduction and random sampling are applied to the current population.
 
@@ -87,7 +86,7 @@ class ODE_GP:
             max_init_depth (int): Max depth of a tree at initialization
             init_method (string): Method used for initialiation of trees
 
-            restart_iter_threshold (int): Threshold (defined in number of generations) that decides to restart a subpopulation when it does not improve in this period
+            restart_probabilities (int): Probability for each subpopulation to restart
             parsimony_punishment (float): Weight that punishes trees for their size.
             similarity_threshold (float): Threshold that decides when a pair of trees are similar
             tournament_size (int): Size of a tournament. Correlated with selection pressure
@@ -127,15 +126,11 @@ class ODE_GP:
         self.tournament_size = tournament_size
         self.tournament_indices = jnp.arange(self.tournament_size)
 
-        # self.selection_pressures = jnp.linspace(0.6,1.0,self.num_populations)
-        self.selection_pressures = jnp.linspace(0.9,0.9,self.num_populations)
+        self.selection_pressures = jnp.linspace(0.7,1.0,self.num_populations)
         self.tournament_probabilities = jnp.array([sp*(1-sp)**self.tournament_indices for sp in self.selection_pressures])
-        # self.reproduction_probabilities = jnp.vstack([jnp.linspace(0.2,0.7,self.num_populations),jnp.linspace(0.4,0.2,self.num_populations),
-                                        #  jnp.linspace(0.5,0.0,self.num_populations),jnp.linspace(0.,0.1,self.num_populations)]).T
-        self.reproduction_probabilities = jnp.vstack([jnp.linspace(0.45,0.45,self.num_populations),jnp.linspace(0.30,0.30,self.num_populations),
-                                         jnp.linspace(0.2,0.2,self.num_populations),jnp.linspace(0.05,0.05,self.num_populations)]).T
-        # self.tree_mutate_probs = jnp.linspace(0.5,0.2,self.num_populations)
-        self.tree_mutate_probs = jnp.linspace(0.5, 0.5, self.num_populations)
+        self.reproduction_probabilities = jnp.vstack([jnp.linspace(0.6,0.4,self.num_populations),jnp.linspace(0.4,0.4,self.num_populations),
+                                         jnp.linspace(0.0,0.2,self.num_populations),jnp.linspace(0.0,0.0,self.num_populations)]).T
+        self.tree_mutate_probs = jnp.linspace(0.8,0.2,self.num_populations)
         
         self.population_indices = jnp.arange(self.population_size)
         self.migration_period = migration_period
@@ -147,8 +142,10 @@ class ODE_GP:
         self.unary_operators_map = {"sin":lambda a:jnp.sin(a), "cos":lambda a:jnp.cos(a)}#,"exp":lambda a:jnp.clip(jnp.exp(a),a_max=100), "sqrt":lambda a:jnp.sqrt(jnp.abs(a))}
         self.binary_operators = list(self.binary_operators_map.keys())
         self.unary_operators = list(self.unary_operators_map.keys())
+        self.unary_operators_prob = 1.0
 
         #Define mutation types
+        self.cross_over_probs = cross_over_probs
         self.mutation_types = ["mutate_operator","delete_operator","insert_operator","mutate_constant","mutate_leaf","sample_subtree","prepend_operator","add_subtree","simplify_tree"]
         self.mutation_probabilities = jnp.ones(len(self.mutation_types))
         self.mutation_probabilities = self.mutation_probabilities.at[self.mutation_types.index("mutate_operator")].set(1.0)
@@ -364,8 +361,10 @@ class ODE_GP:
     #Migration methods
     def migrate_trees(self, sender: list, receiver: list):
         "Selects individuals that will replace randomly selected indivuals in a receiver distribution"
-        sender_distribution = 1/jnp.array([p.fitness for p in sender]) #Select fitter individuals to send with higher probability
-        sender_indices = jrandom.choice(self.keyGen.get(), self.population_indices, shape=(self.migration_size,), p=sender_distribution, replace=False)
+        # sender_distribution = 1/jnp.array([p.fitness for p in sender]) #Select fitter individuals to send with higher probability
+        # sender_indices = jrandom.choice(self.keyGen.get(), self.population_indices, shape=(self.migration_size,), p=sender_distribution, replace=False)
+        sender.sort(key=lambda x: x.fitness)
+        sender = sender[:self.migration_size]
 
         receiver_distribution = jnp.array([p.fitness for p in receiver]) #Select unfit individuals to replace with higher probability
         receiver_indices = jrandom.choice(self.keyGen.get(), self.population_indices, shape=(self.migration_size,), p=receiver_distribution, replace=False)
@@ -373,7 +372,7 @@ class ODE_GP:
         new_population = receiver
 
         for i in range(self.migration_size):
-            new_population[receiver_indices[i]] = sender[sender_indices[i]]
+            new_population[receiver_indices[i]] = sender[i]
 
         return new_population
 
@@ -422,7 +421,7 @@ class ODE_GP:
         if depth == 1: #If depth is reached, a leaf is sampled
             return self.sample_leaf(sd=3)
         
-        leaf_type = jrandom.choice(self.keyGen.get(), jnp.arange(3), p=jnp.array([0.3,0.0,0.7])) #Sample the type of the leaf #NO UNARY OPERATOR NODES
+        leaf_type = jrandom.choice(self.keyGen.get(), jnp.arange(3), p=jnp.array([0.3,1.0-self.unary_operators_prob,0.5])) #Sample the type of the leaf #NO UNARY OPERATOR NODES
         tree = []
         if leaf_type == 0: #leaf
             return self.sample_leaf(sd=3)
@@ -442,7 +441,7 @@ class ODE_GP:
             return self.sample_leaf(sd=3)
         leaf_type = jrandom.uniform(self.keyGen.get(), shape=()) #Sample the type of the leaf #NO UNARY OPERATOR NODES
         tree = []
-        if leaf_type > 1.0: #unary operator
+        if leaf_type > self.unary_operators_prob: #unary operator
             tree.append(self.unary_operators[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(self.unary_operators))])
             tree.append(self.full_node(depth-1))
             return tree
@@ -459,6 +458,7 @@ class ODE_GP:
             return [sd*jrandom.normal(self.keyGen.get())] #constant
         elif leaf_type<0.9:
             return [self.state_variables[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(self.state_variables))]] #Hidden state variable
+            # return [self.variables[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(self.variables))]] #variable
         else:
             return ['target'] #Target
 
@@ -466,7 +466,7 @@ class ODE_GP:
         "Generates a random node for the readout tree that can contain leaves at lower depths"
         if depth == 1:
             return self.sample_readout_leaf(sd=3) #If depth is reached, a leaf is sampled
-        leaf_type = jrandom.choice(self.keyGen.get(), jnp.arange(3), p=jnp.array([0.3,0.0,0.7])) #u=0.3
+        leaf_type = jrandom.choice(self.keyGen.get(), jnp.arange(3), p=jnp.array([0.3,1.0-self.unary_operators_prob,0.5])) #u=0.3
         tree = []
         if leaf_type == 0: #leaf
             return self.sample_readout_leaf(sd=3)
@@ -480,51 +480,65 @@ class ODE_GP:
             tree.append(self.sample_readout_tree(depth-1))
             return tree
 
-    def sample_trees(self, max_depth: int = 3, N: int = 1, num_populations: int = 1, init_method: str = "ramped"):
+    def readout_is_constant(self, readout):
+        #Checks if there are state variables in the readout of a tree
+        contains_state_variables = []
+        leaves = jax.tree_util.tree_leaves(readout)
+        for a in self.state_variables:
+            contains_state_variables.append(a in leaves)
+        return sum(contains_state_variables)==0
+
+    def sample_trees(self, max_depth: int = None, N: int = 1, num_populations: int = 1, init_method: str = "ramped"):
         "Samples multiple populations of models with a certain (max) depth given a specified method"
         assert (init_method=="ramped") or (init_method=="full") or (init_method=="grow"), "This method is not implemented"
+
+        if max_depth == None:
+            max_depth = self.max_depth
 
         populations = []
         if init_method=="grow": #Allows for leaves at lower depths
             for _ in range(num_populations):
                 population = []
                 while len(population) < N:
-                    depth = jrandom.randint(self.keyGen.get(), (), 2, max_depth+1)
                     trees = []
                     for _ in range(self.state_size):
+                        depth = jrandom.randint(self.keyGen.get(), (), 2, max_depth+1)
                         trees.append(self.grow_node(depth))
-                    readout = self.sample_readout_tree(depth)
+                    readout = self.sample_readout_tree(max_depth)
                     new_individual = NetworkTrees(trees, readout)
-                    if new_individual not in population:
+                    if new_individual not in population or self.readout_is_constant(new_individual.readout):
                         population.append(new_individual)
                 populations.append(population)
         elif init_method=="full": #Does not allow for leaves at lower depths
             for _ in range(num_populations):
                 population = []
                 while len(population) < N:
-                    depth = jrandom.randint(self.keyGen.get(), (), 2, max_depth+1)
                     trees = []
                     for _ in range(self.state_size):
+                        depth = jrandom.randint(self.keyGen.get(), (), 2, max_depth+1)
                         trees.append(self.full_node(depth))
-                    readout = self.sample_readout_tree(depth)
+                    readout = self.sample_readout_tree(max_depth)
                     new_individual = NetworkTrees(trees, readout)
-                    if new_individual not in population:
+                    if new_individual not in population or self.readout_is_constant(new_individual.readout):
                         population.append(new_individual)
                 populations.append(population)
         elif init_method=="ramped": #Mixes full and grow initialization, as well as different max depths
             for _ in range(num_populations):
                 population = []
                 while len(population) < N:
-                    depth = jrandom.randint(self.keyGen.get(), (), 2, max_depth+1)
                     trees = []
-                    for _ in range(self.state_size):                                
-                        if jrandom.uniform(self.keyGen.get())>0.5:
+                    for _ in range(self.state_size):            
+                        depth = jrandom.randint(self.keyGen.get(), (), 2, max_depth+1)                    
+                        if jrandom.uniform(self.keyGen.get())>0.7:
                             trees.append(self.full_node(depth))
                         else:
                             trees.append(self.grow_node(depth))
-                    readout = self.sample_readout_tree(depth)
+                    
+                    readout = self.sample_readout_tree(max_depth)
+                    
                     new_individual = NetworkTrees(trees, readout)
-                    if new_individual not in population:
+                    if (new_individual not in population):# and not self.readout_is_constant(readout):
+
                         population.append(new_individual)
                 populations.append(population)
 
@@ -551,7 +565,7 @@ class ODE_GP:
         "Return the subtree from a random node onwards"
         leaves = jax.tree_util.tree_leaves(tree)
         flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
-        distribution = jnp.array([0.5+1.5*self._is_operator(leaf) for leaf in leaves]) #increase selection probability of operators
+        distribution = jnp.array([0.1+1.0*self._is_operator(leaf) for leaf in leaves]) #increase selection probability of operators
         distribution = distribution.at[0].set(0.5) #lower probability of root node
         index = jrandom.choice(self.keyGen.get(), jnp.arange(len(leaves)),p=distribution)
 
@@ -561,77 +575,91 @@ class ODE_GP:
 
         return path, subtree
     
-    def standard_cross_over(self, trees_a: NetworkTrees, trees_b: NetworkTrees):
+    def standard_cross_over(self, trees_a: NetworkTrees, trees_b: NetworkTrees, population_index: int):
         "Performs standard cross-over on a pair of trees, returning two new trees. A cross-over point is selected in both trees, interchanging the subtrees below this point"
+        mutate_bool = jrandom.bernoulli(self.keyGen.get(), p = self.tree_mutate_probs[population_index], shape=(self.state_size+1,))
+        while jnp.sum(mutate_bool)==0: #Make sure that at least one tree is mutated
+            mutate_bool = jrandom.bernoulli(self.keyGen.get(), p = self.tree_mutate_probs[population_index], shape=(self.state_size,))
         for i in range(self.state_size):
-            path_a, subtree_a = self.get_subtree(trees_a()[i])
-            path_b, subtree_b = self.get_subtree(trees_b()[i])
+            if mutate_bool[i]:
+                path_a, subtree_a = self.get_subtree(trees_a()[i])
+                path_b, subtree_b = self.get_subtree(trees_b()[i])
 
-            trees_a = eqx.tree_at(lambda t: self._key_loc(t()[i], path_a), trees_a, subtree_b)
-            trees_b = eqx.tree_at(lambda t: self._key_loc(t()[i], path_b), trees_b, subtree_a)
+                trees_a = eqx.tree_at(lambda t: self._key_loc(t()[i], path_a), trees_a, subtree_b)
+                trees_b = eqx.tree_at(lambda t: self._key_loc(t()[i], path_b), trees_b, subtree_a)
 
-        #Apply cross-over to readout trees as well
-        path_a, subtree_a = self.get_subtree(trees_a.readout_tree)
-        path_b, subtree_b = self.get_subtree(trees_b.readout_tree)
+        #Apply cross-over to readout trees
+        if mutate_bool[-1]:
+            path_a, subtree_a = self.get_subtree(trees_a.readout_tree)
+            path_b, subtree_b = self.get_subtree(trees_b.readout_tree)
 
-        trees_a = eqx.tree_at(lambda t: self._key_loc(t.readout_tree, path_a), trees_a, subtree_b)
-        trees_b = eqx.tree_at(lambda t: self._key_loc(t.readout_tree, path_b), trees_b, subtree_a)
+            trees_a = eqx.tree_at(lambda t: self._key_loc(t.readout_tree, path_a), trees_a, subtree_b)
+            trees_b = eqx.tree_at(lambda t: self._key_loc(t.readout_tree, path_b), trees_b, subtree_a)
 
         return trees_a, trees_b
     
-    def tree_cross_over(self, tree_a: list, tree_b: list):
+    def tree_cross_over(self, trees_a: NetworkTrees, trees_b: NetworkTrees, population_index: int):
         "Applies cross-over on tree level, interchanging only full trees"
-        new_tree_a = tree_a
-        new_tree_b = tree_b
+        new_trees_a = trees_a
+        new_trees_b = trees_b
+
+        mutate_bool = jrandom.bernoulli(self.keyGen.get(), p = self.tree_mutate_probs[population_index], shape=(self.state_size+1,))
+        while jnp.sum(mutate_bool)==0: #Make sure that at least one tree is mutated
+            mutate_bool = jrandom.bernoulli(self.keyGen.get(), p = self.tree_mutate_probs[population_index], shape=(self.state_size,))
         for i in range(self.state_size):
-            if jrandom.uniform(self.keyGen.get()) > 0.5:
-                new_tree_a = eqx.tree_at(lambda t: t()[i], new_tree_a, tree_b()[i])
-                new_tree_b = eqx.tree_at(lambda t: t()[i], new_tree_b, tree_a()[i])
-        if jrandom.uniform(self.keyGen.get()) > 0.5: #Apply cross-over to readout
-            new_tree_a = eqx.tree_at(lambda t: t.readout_tree, new_tree_a, tree_b.readout_tree)
-            new_tree_b = eqx.tree_at(lambda t: t.readout_tree, new_tree_b, tree_a.readout_tree)
-        return new_tree_a, new_tree_b
+            if mutate_bool[i]:
+                new_trees_a = eqx.tree_at(lambda t: t()[i], new_trees_a, trees_b()[i])
+                new_trees_b = eqx.tree_at(lambda t: t()[i], new_trees_b, trees_a()[i])
+        if mutate_bool[-1]: #Apply cross-over to readout
+            new_trees_a = eqx.tree_at(lambda t: t.readout_tree, new_trees_a, trees_b.readout_tree)
+            new_trees_b = eqx.tree_at(lambda t: t.readout_tree, new_trees_b, trees_a.readout_tree)
+        return new_trees_a, new_trees_b
 
-    def uniform_cross_over(self, tree_a: list, tree_b: list):
+    def uniform_cross_over(self, trees_a: NetworkTrees, trees_b: NetworkTrees, population_index: int):
         "Performs uniform cross-over on a pair of trees, returning two new trees. Each overlapping node is switched with 50% chance and children of boundary nodes are switched as well."
+        mutate_bool = jrandom.bernoulli(self.keyGen.get(), p = self.tree_mutate_probs[population_index], shape=(self.state_size+1,))
+        while jnp.sum(mutate_bool)==0: #Make sure that at least one tree is mutated
+            mutate_bool = jrandom.bernoulli(self.keyGen.get(), p = self.tree_mutate_probs[population_index], shape=(self.state_size,))
         for i in range(self.state_size): #Get intersection of the trees
-            interior_nodes, boundary_nodes = self.tree_intersection(tree_a()[i], tree_b()[i], path = [], interior_nodes = [], boundary_nodes = [])
-            new_tree_a = tree_a
-            new_tree_b = tree_b
+            if mutate_bool[i]:
+                interior_nodes, boundary_nodes = self.tree_intersection(trees_a()[i], trees_b()[i], path = [], interior_nodes = [], boundary_nodes = [])
+                new_trees_a = trees_a
+                new_trees_b = trees_b
 
-            for node in interior_nodes: #Randomly switch two nodes of interior intersecting nodes
-                if jrandom.uniform(self.keyGen.get()) > 0.5:
-                    new_tree_a = eqx.tree_at(lambda t: self._index_loc(t()[i], node), new_tree_a, self._index_loc(tree_b()[i], node))
-                    new_tree_b = eqx.tree_at(lambda t: self._index_loc(t()[i], node), new_tree_b, self._index_loc(tree_a()[i], node))
+                for node in interior_nodes: #Randomly switch two nodes of interior intersecting nodes
+                    if jrandom.uniform(self.keyGen.get()) > 0.5:
+                        new_trees_a = eqx.tree_at(lambda t: self._index_loc(t()[i], node), new_trees_a, self._index_loc(trees_b()[i], node))
+                        new_trees_b = eqx.tree_at(lambda t: self._index_loc(t()[i], node), new_trees_b, self._index_loc(trees_a()[i], node))
 
-            for node in boundary_nodes: #Randomly switch two nodes and their children of boundary intersecting nodes
-                if jrandom.uniform(self.keyGen.get()) > 0.5:
-                    new_tree_a = eqx.tree_at(lambda t: self._index_loc(t()[i], node[:-1]), new_tree_a, self._index_loc(tree_b()[i], node[:-1]))
-                    new_tree_b = eqx.tree_at(lambda t: self._index_loc(t()[i], node[:-1]), new_tree_b, self._index_loc(tree_a()[i], node[:-1]))
-            
-            tree_a = new_tree_a
-            tree_b = new_tree_b
+                for node in boundary_nodes: #Randomly switch two nodes and their children of boundary intersecting nodes
+                    if jrandom.uniform(self.keyGen.get()) > 0.5:
+                        new_trees_a = eqx.tree_at(lambda t: self._index_loc(t()[i], node[:-1]), new_trees_a, self._index_loc(trees_b()[i], node[:-1]))
+                        new_trees_b = eqx.tree_at(lambda t: self._index_loc(t()[i], node[:-1]), new_trees_b, self._index_loc(trees_a()[i], node[:-1]))
+                
+                trees_a = new_trees_a
+                trees_b = new_trees_b
 
         #Apply cross-over to readout
-        interior_nodes, boundary_nodes = self.tree_intersection(tree_a.readout_tree, tree_b.readout_tree, path = [], interior_nodes = [], boundary_nodes = [])
-        new_tree_a = tree_a
-        new_tree_b = tree_b
+        if mutate_bool[-1]:
+            interior_nodes, boundary_nodes = self.tree_intersection(trees_a.readout_tree, trees_b.readout_tree, path = [], interior_nodes = [], boundary_nodes = []) 
+            new_trees_a = trees_a
+            new_trees_b = trees_b
 
-        #Randomly switch two nodes of interior intersecting nodes
-        for node in interior_nodes:
-            if jrandom.uniform(self.keyGen.get()) > 0.5:
-                new_tree_a = eqx.tree_at(lambda t: self._index_loc(t.readout_tree, node), new_tree_a, self._index_loc(tree_b.readout_tree, node))
-                new_tree_b = eqx.tree_at(lambda t: self._index_loc(t.readout_tree, node), new_tree_b, self._index_loc(tree_a.readout_tree, node))
-        #Randomly switch two nodes and their children of boundary intersecting nodes
-        for node in boundary_nodes:
-            if jrandom.uniform(self.keyGen.get()) > 0.5:
-                new_tree_a = eqx.tree_at(lambda t: self._index_loc(t.readout_tree, node[:-1]), new_tree_a, self._index_loc(tree_b.readout_tree, node[:-1]))
-                new_tree_b = eqx.tree_at(lambda t: self._index_loc(t.readout_tree, node[:-1]), new_tree_b, self._index_loc(tree_a.readout_tree, node[:-1]))
-        
-        tree_a = new_tree_a
-        tree_b = new_tree_b
+            #Randomly switch two nodes of interior intersecting nodes
+            for node in interior_nodes:
+                if jrandom.uniform(self.keyGen.get()) > 0.5:
+                    new_trees_a = eqx.tree_at(lambda t: self._index_loc(t.readout_tree, node), new_trees_a, self._index_loc(trees_b.readout_tree, node))
+                    new_trees_b = eqx.tree_at(lambda t: self._index_loc(t.readout_tree, node), new_trees_b, self._index_loc(trees_a.readout_tree, node))
+            #Randomly switch two nodes and their children of boundary intersecting nodes
+            for node in boundary_nodes:
+                if jrandom.uniform(self.keyGen.get()) > 0.5:
+                    new_trees_a = eqx.tree_at(lambda t: self._index_loc(t.readout_tree, node[:-1]), new_trees_a, self._index_loc(trees_b.readout_tree, node[:-1]))
+                    new_trees_b = eqx.tree_at(lambda t: self._index_loc(t.readout_tree, node[:-1]), new_trees_b, self._index_loc(trees_a.readout_tree, node[:-1]))
+            
+            trees_a = new_trees_a
+            trees_b = new_trees_b
 
-        return tree_a, tree_b
+        return trees_a, trees_b
     
     #Mutation methods
     def insert_operator(self, tree: list, readout: bool = False):
@@ -644,7 +672,7 @@ class ODE_GP:
         subtree = self._key_loc(tree, path)
         
         operator_type = jrandom.uniform(self.keyGen.get())
-        if operator_type>1.0: #unary operator
+        if operator_type>self.unary_operators_prob: #unary operator
             new_operator = self.unary_operators[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(self.unary_operators))]
             new_tree = [new_operator, subtree]
         else: #binary operator
@@ -694,7 +722,7 @@ class ODE_GP:
 
     def prepend_operator(self, tree: list, readout: bool = False):
         "Add an operator to the top of the tree"
-        if jrandom.uniform(self.keyGen.get())>1.0:
+        if jrandom.uniform(self.keyGen.get())>self.unary_operators_prob:
             new_operator = self.unary_operators[jrandom.randint(self.keyGen.get(), shape=(), minval=0, maxval=len(self.unary_operators))]
             new_tree = [new_operator, tree]
         else:
@@ -794,8 +822,6 @@ class ODE_GP:
                 new_tree = self.mutate_tree(tree, allow_simplification=False, readout=readout)
             else:
                 new_tree = simplified_tree
-        if (self._tree_depth(new_tree) > self.max_depth): #If the new tree exceeds the max depth, apply mutation to the original tree again
-            new_tree = self.mutate_tree(tree,readout=readout)
         return new_tree
 
     #Selection and reproduction methods
@@ -814,92 +840,88 @@ class ODE_GP:
     
     def next_population(self, population: list, mean_fitness: float, population_index: int):
         "Generates a new population by evolving the current population. After cross-over and mutation, the new trees are checked to be different from their parents."
-        remaining_candidates = len(population)
+        
+        population.sort(key=lambda x: x.fitness)
         new_pop = []
+        elite_size = int(self.population_size*0.1)
+        for i in range(elite_size):
+            new_pop.append(population[i])
+        remaining_candidates = self.population_size - elite_size
         failed_mutations = 0
 
-        while remaining_candidates>1: #Loop until new population has reached the desired size
-            probs = self.reproduction_probabilities[population_index]
-            tree_a = self.tournament_selection(population, population_index)
-            tree_b = self.tournament_selection(population, population_index)
+        while remaining_candidates>0: #Loop until new population has reached the desired size
+            probs = self.reproduction_probabilities[population_index].copy()
+            trees_a = self.tournament_selection(population, population_index)
+            trees_b = self.tournament_selection(population, population_index)
 
-            similarity = self.similarities(tree_a, tree_b)
-            if tree_a.fitness > mean_fitness and tree_b.fitness > mean_fitness:
+            similarity = self.similarities(trees_a, trees_b)
+            if trees_a.fitness > mean_fitness and trees_b.fitness > mean_fitness:
                 probs = [0,0.5,0.5,0] #Do not apply cross-over if trees have poor fitness
 
             elif similarity > self.similarity_threshold:
                 probs = [0,0.6,0.3,0.1] #Do not apply crossover if trees are similar
 
+            elif remaining_candidates==1:
+                probs = probs.at[0].set(0)
+
             reproduction_type = jrandom.choice(self.keyGen.get(), jnp.arange(4), p=jnp.array(probs))
                 
             if reproduction_type==0: #Cross-over
-                cross_over_type = jrandom.uniform(self.keyGen.get()) #Sample a cross-over method           
-                if cross_over_type < 0.3:
-                    new_tree_a, new_tree_b = self.tree_cross_over(tree_a, tree_b)
-                elif cross_over_type < 0.7:
-                    new_tree_a, new_tree_b = self.uniform_cross_over(tree_a, tree_b)
+                cross_over_type = jrandom.choice(self.keyGen.get(), jnp.arange(3), p=self.cross_over_probs) #Sample a cross-over method           
+                if cross_over_type == 0:
+                    new_trees_a, new_trees_b = self.tree_cross_over(trees_a, trees_b, population_index)
+                elif cross_over_type == 1:
+                    new_trees_a, new_trees_b = self.uniform_cross_over(trees_a, trees_b, population_index)
                 else:
-                    new_tree_a, new_tree_b = self.standard_cross_over(tree_a, tree_b)
+                    new_trees_a, new_trees_b = self.standard_cross_over(trees_a, trees_b, population_index)
 
-                #If both trees remain the same or one of the trees exceeds the max depth, cross-over has failed
-                if eqx.tree_equal(tree_a, new_tree_a) and eqx.tree_equal(tree_b, new_tree_b):
-                    failed_mutations += 1
-                elif (self._tree_depth(new_tree_a) > self.max_depth) or (self._tree_depth(new_tree_b) > self.max_depth):
+                #If a tree remain the same or one of the trees exceeds the max depth or has already been added to the new population, cross-over has failed
+                if eqx.tree_equal(trees_a, new_trees_a) or new_trees_a in population or (self._tree_depth(new_trees_a) > self.max_depth):
                     failed_mutations += 1
                 else:
                     #Append new trees to the new population
-                    new_pop.append(new_tree_a)
-                    new_pop.append(new_tree_b)
-                    remaining_candidates -= 2
+                    new_pop.append(new_trees_a)
+                    remaining_candidates -= 1
+
+                #If a tree remain the same or one of the trees exceeds the max depth or has already been added to the new population, cross-over has failed
+                if eqx.tree_equal(trees_b, new_trees_b) or new_trees_b in population or (self._tree_depth(new_trees_b) > self.max_depth):
+                    failed_mutations += 1
+                else:
+                    #Append new trees to the new population
+                    new_pop.append(new_trees_b)
+                    remaining_candidates -= 1
 
             elif reproduction_type==1: #Mutation
-                mutate_bool = jrandom.uniform(self.keyGen.get(), shape=(self.state_size,))
-                while not any(mutate_bool>self.tree_mutate_probs[population_index]): #Make sure that at least one tree is mutated
-                    mutate_bool = jrandom.uniform(self.keyGen.get(), shape=(self.state_size,))
+                mutate_bool = jrandom.bernoulli(self.keyGen.get(), p = self.tree_mutate_probs[population_index], shape=(self.state_size+1,))
+                while jnp.sum(mutate_bool)==0: #Make sure that at least one tree is mutated
+                    mutate_bool = jrandom.bernoulli(self.keyGen.get(), p = self.tree_mutate_probs[population_index], shape=(self.state_size+1,))
 
-                new_tree_a = tree_a
+                new_trees_a = trees_a
                 for i in range(self.state_size):
-                    if mutate_bool[i]>self.tree_mutate_probs[population_index]:
-                        new_tree = self.mutate_tree(tree_a()[i])
-                        new_tree_a = eqx.tree_at(lambda t: t()[i], new_tree_a, new_tree)
-                if jrandom.uniform(self.keyGen.get()) > self.tree_mutate_probs[population_index]: #Mutate readout tree
-                    new_tree_a = eqx.tree_at(lambda t: t.readout_tree, new_tree_a, self.mutate_tree(new_tree_a.readout_tree, readout=True))
-                #Add new tree to the new population
-                new_pop.append(new_tree_a)
-                remaining_candidates -= 1
-
-                mutate_bool = jrandom.uniform(self.keyGen.get(), shape=(self.state_size,))
-                while not any(mutate_bool>self.tree_mutate_probs[population_index]): #Make sure that at least one tree is mutated
-                    mutate_bool = jrandom.uniform(self.keyGen.get(), shape=(self.state_size,))
-
-                new_tree_b = tree_b
-                for i in range(self.state_size):
-                    if mutate_bool[i]>self.tree_mutate_probs[population_index]:
-                        new_tree = self.mutate_tree(tree_b()[i])
-                        new_tree_b = eqx.tree_at(lambda t: t()[i], new_tree_b, new_tree)
-                if jrandom.uniform(self.keyGen.get()) > self.tree_mutate_probs[population_index]: #Mutate readout tree
-                    new_tree_b = eqx.tree_at(lambda t: t.readout_tree, new_tree_b, self.mutate_tree(new_tree_b.readout_tree, readout=True))
-                #Add new tree to the new population
-                new_pop.append(new_tree_b)
-                remaining_candidates -= 1
+                    if mutate_bool[i]:
+                        new_tree = self.mutate_tree(trees_a()[i])
+                        new_trees_a = eqx.tree_at(lambda t: t()[i], new_trees_a, new_tree)
+                if mutate_bool[-1]: #Mutate readout tree
+                    new_trees_a = eqx.tree_at(lambda t: t.readout_tree, new_trees_a, self.mutate_tree(new_trees_a.readout_tree, readout=True))
+                
+                #If a tree remain the same or one of the trees exceeds the max depth or has already been added to the new population, cross-over has failed
+                if eqx.tree_equal(trees_a, new_trees_a) or new_trees_a in population or (self._tree_depth(new_trees_a) > self.max_depth):
+                    failed_mutations += 1
+                else:
+                    #Append new trees to the new population
+                    new_pop.append(new_trees_a)
+                    remaining_candidates -= 1
 
             elif reproduction_type==2: #Sample new trees
-                new_trees = self.sample_trees(max_depth=self.max_init_depth, N=2, init_method="full")[0]
+                new_trees = self.sample_trees(max_depth=self.max_init_depth, N=1, init_method="full")
                 #Add new trees to the new population
-                remaining_candidates -= 2
-                new_pop.append(new_trees[0])
-                new_pop.append(new_trees[1])
+                remaining_candidates -= 1
+                new_pop.append(new_trees)
             elif reproduction_type==3: #Reproduction
-                remaining_candidates -= 2
+                remaining_candidates -= 1
                 #Add new trees to the new population
-                new_pop.append(tree_a)
-                new_pop.append(tree_b)
+                new_pop.append(trees_a)
         
-        best_candidate = sorted(population, key=lambda x: x.fitness, reverse=False)[0] #Keep best candidate in new population
-        if remaining_candidates==0:
-            new_pop[0] = best_candidate
-        else:
-            new_pop.append(best_candidate)
         return new_pop
    
     #Evaluation methods
@@ -950,7 +972,6 @@ class ODE_GP:
             activities (Array[float]): Activities of the hidden state of the model at every time point
             fitness (float): Fitness of the model 
         """
-
         env = copy.copy(self.env)
         env.initialize(params)
 
@@ -958,7 +979,7 @@ class ODE_GP:
         tree_funcs = self.evaluate_trees(model)
         state_equation = jax.jit(lambda y, a, u, tar: jnp.array([tree_funcs[i](y, a, u, tar) for i in range(self.state_size)]))
         readout_layer = self.evaluate_tree(model.readout_tree)
-        readout = lambda y, a, _, tar: readout_layer(y, a, _, tar)
+        readout = lambda y, a, _, tar: jnp.atleast_1d([readout_layer(y, a, _, tar)])
 
         #Define state equation
         def _drift(t, x_a, args):
@@ -968,7 +989,8 @@ class ODE_GP:
             # jax.debug.print("P={P}", P=a[2:])
 
             y = env.f_obs(t, x) #Get observations from system
-            u = jnp.array([readout(y, a, 0, target)]) #Readout control from hidden state
+            u = readout(y, a, 0, target) #Readout control from hidden state
+            # u = a
             
             dx = env.drift(t, x, u) #Apply control to system and get system change
             da = state_equation(y, a, u, target) #Compute hidden state updates
@@ -980,7 +1002,8 @@ class ODE_GP:
             a = x_a[self.latent_size:]
             y = env.f_obs(t, x)
             u = jnp.array([readout(y, a, 0, target)])
-            return jnp.concatenate([env.diffusion(t, x, u), jnp.zeros((self.state_size, 2))]) #Only the system is stochastic
+            # u = a
+            return jnp.concatenate([env.diffusion(t, x, u), jnp.zeros((self.state_size, self.latent_size))]) #Only the system is stochastic
         
         solver = diffrax.Euler()
         dt0 = 0.005
@@ -988,26 +1011,29 @@ class ODE_GP:
         _x0 = jnp.concatenate([x0, jnp.zeros(self.state_size)])
         # _x0 = jnp.concatenate([x0, jnp.zeros(2), jnp.array([1,0,0,1])*self.env.obs_noise])
 
-        brownian_motion = diffrax.UnsafeBrownianPath(shape=(2,), key=key)
+        brownian_motion = diffrax.UnsafeBrownianPath(shape=(self.latent_size,), key=key)
         system = diffrax.MultiTerm(diffrax.ODETerm(_drift), diffrax.ControlTerm(_diffusion, brownian_motion))
 
         sol = diffrax.diffeqsolve(
             system, solver, ts[0], ts[-1], dt0, _x0, saveat=saveat, adjoint=diffrax.DirectAdjoint(), max_steps=16**4
         )
-
         xs = sol.ys[:,:self.latent_size]
         ys = jax.vmap(env.f_obs)(ts, xs) #Map states to observations
         activities = sol.ys[:,self.latent_size:]
-        us = jax.vmap(readout, in_axes=[0,0,None, None])(ys, activities, jnp.array([0]), target) #Map hidden state to control
-        fitness = env.fitness_function(xs, us, target) #Compute fitness with cost function in the environment
+        
+        us = jax.vmap(readout, in_axes=[0,0,None,None])(ys, activities, jnp.array([0]), target) #Map hidden state to control 
+        # us = activities   
+        # fitness = jax.lax.cond(jnp.isnan(us).any(),lambda x, u, t: 1e3*jnp.ones(ts.shape), lambda x, u, t: env.fitness_function(x, u, t), xs, us, target) #Compute fitness with cost function in the environment
+        fitness = env.fitness_function(xs, us, target)
+
         return xs, ys, us, activities, fitness
-    
+
     def get_fitness(self, model: NetworkTrees, data: Tuple, add_regularization: bool = True):
         "Determine the fitness of a tree by simulating the environment and controller as a coupled system"
         x0, ts, targets, noise_keys, params = data
         _, _, _, _, fitness = jax.vmap(self.evaluate_control_loop, in_axes=[None, 0, None, 0, 0, 0])(model, x0, ts, targets, noise_keys, params) #Run coupled differential equations of state and control and get fitness of the model
 
-        fitness = jnp.mean(fitness[:,-1])*self.dt
+        fitness = jnp.mean(fitness[:,-1])
         
         if jnp.isinf(fitness) or jnp.isnan(fitness):
             fitness = jnp.array(1e6)
@@ -1017,7 +1043,7 @@ class ODE_GP:
             return jnp.clip(fitness,0,1e6)
     
     #Main algorithms
-    def random_search(self, env, data, num_generations, pool_size = 10, continue_population=None, converge_value=0.0):
+    def random_search(self, env, validation_data: Tuple, num_generations: int, pool_size: int = 10, converge_value: float = 0.0):
         """
         Applies random search to find the best solution. At every generation a new population is sampled and the best solution is kept alive.
         Inputs:
@@ -1040,15 +1066,13 @@ class ODE_GP:
         self.initialize_variables(env)
 
         best_fitnesses = jnp.zeros(num_generations)
-        best_solutions = []
-        if continue_population is None:
-            #Initialize new population
-            populations = self.sample_trees(self.max_depth, self.population_size, num_populations=self.num_populations, init_method=self.init_method)
-        else:
-            #Continue from a previous population
-            populations = continue_population
+        best_solution = None
+        best_fitness = jnp.inf
+
+        populations = self.sample_trees(self.max_depth, self.population_size, num_populations=self.num_populations, init_method=self.init_method)
         
         for g in range(num_generations):
+            data = self.datasampler.get_data()
             pool.restart()
             fitness = pool.amap(lambda x: self.get_fitness(x,data),self.flatten(populations)) #Evaluate each solution parallely on a pool of workers
             pool.close()
@@ -1064,45 +1088,39 @@ class ODE_GP:
 
             flat_fitnesses = jnp.array(fitness.get())
             fitnesses = jnp.reshape(flat_fitnesses,(self.num_populations,self.population_size))
-            
-            #Set the fitness of each solution
-            for pop in range(self.num_populations):
-                population = populations[pop]
-                for candidate in range(self.population_size):
-                    population[candidate].set_fitness(fitnesses[pop,candidate])
-            best_fitnesses = best_fitnesses.at[g].set(self.get_fitness(self._best_solution(populations, fitnesses), data, add_regularization=False))
 
-            if best_fitnesses[g]<converge_value: #A solution reached a satisfactory score
-                best_solution = self._best_solution(populations, fitnesses)
+            best_solution_of_g = self._best_solution(populations, fitnesses)
+            best_val_fitness = self.get_fitness(best_solution_of_g, validation_data, add_regularization=False)
+            if best_val_fitness < best_fitness:
+                best_fitness = best_val_fitness
+                best_solution = best_solution_of_g
+            best_fitnesses = best_fitnesses.at[g].set(best_fitness)
+
+            if best_fitnesses[g]<converge_value and best_fitnesses[g]==best_fitnesses[g-2]: #A solution reached a satisfactory score
                 best_solution_string = self.trees_to_sympy(best_solution)
-                best_solutions.append(best_solution)
-                print(f"Converge settings satisfied, best fitness {jnp.min(fitnesses)}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
-                best_fitnesses = best_fitnesses.at[g:].set(best_fitnesses[g])
+                print(f"Converge settings satisfied, best fitness {best_fitness}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
+                best_fitnesses = best_fitnesses.at[g:].set(best_fitness)
 
                 break
 
             elif g < num_generations-1: #The final generation has not been reached yet, so a new population is sampled
-                best_solution = self._best_solution(populations, fitnesses)
                 best_solution_string = self.trees_to_sympy(best_solution)
-                print(f"In generation {g+1}, average fitness: {jnp.mean(fitnesses)}, best_fitness: {jnp.min(fitnesses)}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
+                print(f"In generation {g+1}, average fitness: {jnp.mean(fitnesses)}, best_fitness: {best_fitness}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
+
+                #Migrate individuals between populations every few generations
+                if ((g+1)%self.migration_period)==0:
+                    populations = self.migrate_populations(populations)
                               
-                best_candidates = []
-                for pop in range(self.num_populations):
-                    best_candidates.append(sorted(populations[pop], key=lambda x: x.fitness, reverse=False)[0])
-                populations = self.sample_trees(self.max_depth, self.population_size-1, num_populations=self.num_populations, init_method="grow")
-                for pop in range(self.num_populations):
-                    populations[pop].append(best_candidates[pop])
+                populations = self.sample_trees(self.max_depth, self.population_size, num_populations=self.num_populations, init_method="grow")
                 
             else: #Final generation is reached
-                best_solution = self._best_solution(populations, fitnesses)
                 best_solution_string = self.trees_to_sympy(best_solution)
-                best_solutions.append(best_solution)
-                print(f"Final generation, average fitness: {jnp.mean(fitnesses)}, best_fitness: {jnp.min(fitnesses)}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
+                print(f"Final generation, average fitness: {jnp.mean(fitnesses)}, best_fitness: {best_fitness}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
 
-        return best_fitnesses, best_solutions, populations
+        return best_fitnesses, best_solution, populations
 
     #Runs the GP algorithm for a given number of runs and generations. It is possible to continue on a previous population or start from a new population.
-    def run(self, env, data, num_generations, pool_size, continue_population=None, converge_value=0, insert_solution=None):
+    def run(self, env, data: Tuple, num_generations: int, pool_size: int = 10, continue_population = None, converge_value: float = 0.0, insert_solution = None):
         """
         Runs the genetic programming algorithm to find the best solution. New solutions are proposed by applying evolutionary operations to fit solutions.
         Inputs:
@@ -1119,17 +1137,21 @@ class ODE_GP:
             populations (list): Final population that can be used to continue a run from
         """
 
-        pool = Pool(pool_size)
+        pool = Pool(pool_size)  
         pool.close()
 
         self.initialize_variables(env)
 
         best_fitnesses = jnp.zeros(num_generations)
+        best_solution = None
+        best_fitness = jnp.inf
         best_fitness_per_population = jnp.zeros((num_generations, self.num_populations))
-        best_solutions = []
+
+        last_restart = jnp.zeros(self.num_populations)
+
         if continue_population is None:
             #Initialize new population
-            populations = self.sample_trees(self.max_depth, self.population_size, num_populations=self.num_populations, init_method=self.init_method)
+            populations = self.sample_trees(self.max_init_depth, self.population_size, num_populations=self.num_populations, init_method=self.init_method)
         else:
             #Continue from a previous population
             populations = continue_population
@@ -1153,6 +1175,7 @@ class ODE_GP:
 
             flat_fitnesses = jnp.array(fitness.get())
             fitnesses = jnp.reshape(flat_fitnesses,(self.num_populations,self.population_size))
+            # print(jnp.mean(fitnesses, axis=1),jnp.min(fitnesses, axis=1))
 
             best_fitness_per_population = best_fitness_per_population.at[g].set(jnp.min(fitnesses, axis=1))
             
@@ -1161,38 +1184,45 @@ class ODE_GP:
                 population = populations[pop]
                 for candidate in range(self.population_size):
                     population[candidate].set_fitness(fitnesses[pop,candidate])
-            best_fitnesses = best_fitnesses.at[g].set(self.get_fitness(self._best_solution(populations, fitnesses), data, add_regularization=False))
 
-            if best_fitnesses[g]<converge_value: #A solution reached a satisfactory score
-                best_solution = self._best_solution(populations, fitnesses)
+            best_solution_of_g = self._best_solution(populations, fitnesses)
+            best_fitness_at_g = self.get_fitness(best_solution_of_g, data, add_regularization=False)
+            if best_solution is not None:
+                best_fitness = self.get_fitness(best_solution, data, add_regularization=False)
+            if best_fitness_at_g < best_fitness:
+                best_fitness = best_fitness_at_g
+                best_solution = best_solution_of_g
+            best_fitnesses = best_fitnesses.at[g].set(best_fitness)
+
+            if best_fitnesses[g]<converge_value and best_fitnesses[g]==best_fitnesses[g-2]: #A solution reached a satisfactory score
                 best_solution_string = self.trees_to_sympy(best_solution)
-                best_solutions.append(best_solution)
-                print(f"Converge settings satisfied, best fitness {jnp.min(fitnesses)}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
-                best_fitnesses = best_fitnesses.at[g:].set(best_fitnesses[g])
+                print(f"Converge settings satisfied, best fitness {best_fitness}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
+                best_fitnesses = best_fitnesses.at[g:].set(best_fitness)
 
                 break
 
             elif g < num_generations-1: #The final generation has not been reached yet, so a new population is sampled
-                best_solution = self._best_solution(populations, fitnesses)
                 best_solution_string = self.trees_to_sympy(best_solution)
-                print(f"In generation {g+1}, average fitness: {jnp.mean(fitnesses)}, best_fitness: {jnp.min(fitnesses)}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
+                print(f"In generation {g+1}, average fitness: {jnp.mean(fitnesses)}, best_fitness: {best_fitness}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
 
                 #Migrate individuals between populations every few generations
                 if ((g+1)%self.migration_period)==0:
                     populations = self.migrate_populations(populations)
+
+                last_restart = last_restart + 1
                               
                 for pop in range(self.num_populations):
                     #Generate new population
-                    if g>self.restart_iter_threshold and best_fitness_per_population[g,pop] == best_fitness_per_population[g-self.restart_iter_threshold,pop]:
-                        print(f"Restart in population {pop+1} at generation {g+1}")
+                    if last_restart[pop]>self.restart_iter_threshold[pop] and best_fitness_per_population[g,pop] >= best_fitness_per_population[g-self.restart_iter_threshold[pop],pop]:
+                        print(f"Stuck restart in population {pop+1}")
                         populations[pop] = self.sample_trees(self.max_init_depth, self.population_size, num_populations=1, init_method=self.init_method)[0]
+                        last_restart = last_restart.at[pop].set(0)
                     else:
                         populations[pop] = self.next_population(populations[pop], jnp.mean(flat_fitnesses), pop)
+                self.env.update_thresholds()
                 
             else: #Final generation is reached
-                best_solution = self._best_solution(populations, fitnesses)
                 best_solution_string = self.trees_to_sympy(best_solution)
-                best_solutions.append(best_solution)
-                print(f"Final generation, average fitness: {jnp.mean(fitnesses)}, best_fitness: {jnp.min(fitnesses)}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
+                print(f"Final generation, average fitness: {jnp.mean(fitnesses)}, best_fitness: {best_fitness}, best solution: {best_solution_string}, readout: {self.tree_to_sympy(best_solution.readout_tree)}")
 
-        return best_fitnesses, best_solutions, populations
+        return best_fitnesses, best_solution, populations
