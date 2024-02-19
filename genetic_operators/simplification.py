@@ -1,16 +1,15 @@
 import jax.numpy as jnp
 import sympy
-
-from networkTrees import NetworkTrees
+from miscellaneous.expression import Node
 
 def tree_to_string(tree: list):
     "Transform tree to string"
     if len(tree)==3:
         left_tree = "(" + tree_to_string(tree[1]) + ")" if len(tree[1]) == 3 else tree_to_string(tree[1])
         right_tree = "(" + tree_to_string(tree[2]) + ")" if len(tree[2]) == 3 else tree_to_string(tree[2])
-        return left_tree + tree[0] + right_tree
+        return left_tree + str(tree[0]) + right_tree
     elif len(tree)==2:
-        return tree[0] + "(" + tree_to_string(tree[1]) + ")"
+        return str(tree[0]) + "(" + tree_to_string(tree[1]) + ")"
     else:
         return str(tree[0])
     
@@ -22,10 +21,10 @@ def tree_to_sympy(tree: list, eval: bool = True):
     
     return expr
 
-def trees_to_sympy(trees: NetworkTrees):
+def trees_to_sympy(trees: list):
     "Transforms trees to sympy formats"
     sympy_trees = []
-    for tree in trees():
+    for tree in trees:
         sympy_trees.append(tree_to_sympy(tree))
     return sympy_trees
 
@@ -36,8 +35,8 @@ def replace_negatives(tree: list):
     left_tree = replace_negatives(tree[1])
     right_tree = replace_negatives(tree[2])
 
-    if tree[0]=="+" and right_tree[0]=="*" and right_tree[1]==-1.0:
-        return ["-", left_tree, right_tree[2]]
+    if str(tree[0])=="+" and str(right_tree[0])=="*" and right_tree[1]==-1.0:
+        return [Node(lambda x, y: x - y, "-"), left_tree, right_tree[2]]
     return [tree[0], left_tree, right_tree]
 
 def sympy_to_tree(sympy_expr, mode: str):
@@ -45,7 +44,8 @@ def sympy_to_tree(sympy_expr, mode: str):
     if isinstance(sympy_expr,sympy.Float) or isinstance(sympy_expr,sympy.Integer):
         return [jnp.array(float(sympy_expr))]
     elif isinstance(sympy_expr,sympy.Symbol):
-        return [str(sympy_expr)]
+        symbol, index = str(sympy_expr)[:-1], str(sympy_expr)[-1]
+        return [Node(lambda args: args[symbol][int(index)], str(sympy_expr))]
     elif isinstance(sympy_expr,sympy.core.numbers.NegativeOne):
         return [jnp.array(-1)]
     elif isinstance(sympy_expr,sympy.core.numbers.Zero):
@@ -61,26 +61,28 @@ def sympy_to_tree(sympy_expr, mode: str):
                 right_tree = sympy_to_tree(sympy_expr.args[1:], "Add")
             else:
                 right_tree = sympy_to_tree(sympy_expr.args[1], "Add")
-            return ["+",left_tree,right_tree]
+            return [Node(lambda x, y: x + y, "+"),left_tree,right_tree]
         if isinstance(sympy_expr,sympy.Mul):
             left_tree = sympy_to_tree(sympy_expr.args[0], "Mul")
             if len(sympy_expr.args)>2:
                 right_tree = sympy_to_tree(sympy_expr.args[1:], "Mul")
             else:
                 right_tree = sympy_to_tree(sympy_expr.args[1], "Mul")
-            return ["*",left_tree,right_tree]
+            return [Node(lambda x, y: x * y, "*"),left_tree,right_tree]
         if isinstance(sympy_expr,sympy.cos):
-            return ["cos",sympy_to_tree(sympy_expr.args[0], mode=None)]
+            return [Node(lambda x: jnp.cos(x), "cos"),sympy_to_tree(sympy_expr.args[0], mode=None)]
         if isinstance(sympy_expr,sympy.sin):
-            return ["sin",sympy_to_tree(sympy_expr.args[0], mode=None)]
+            return [Node(lambda x: jnp.sin(x), "sin"),sympy_to_tree(sympy_expr.args[0], mode=None)]
+        if isinstance(sympy_expr,sympy.tanh):
+            return [Node(lambda x: jnp.tanh(x), "tanh"),sympy_to_tree(sympy_expr.args[0], mode=None)]
         if isinstance(sympy_expr, sympy.Pow):
             if sympy_expr.args[1]==-1:
                 right_tree = sympy_to_tree(sympy_expr.args[0], "Mul")
-                return ["/",[jnp.array(1)],right_tree]
+                return [Node(lambda x, y: x / y, "/"),[jnp.array(1)],right_tree]
             else:
                 left_tree = sympy_to_tree(sympy_expr.args[0], "Add")
                 right_tree = sympy_to_tree(sympy_expr.args[1], "Add")
-                return ["**", left_tree, right_tree]
+                return [Node(lambda x, y: x ** y, "**"), left_tree, right_tree]
     else:
         if mode=="Add":
             left_tree = sympy_to_tree(sympy_expr[0], "Add")
@@ -88,14 +90,14 @@ def sympy_to_tree(sympy_expr, mode: str):
                 right_tree = sympy_to_tree(sympy_expr[1:], "Add")
             else:
                 right_tree = sympy_to_tree(sympy_expr[1], "Add")
-            return ["+",left_tree,right_tree]
+            return [Node(lambda x, y: x + y, "+"),left_tree,right_tree]
         if mode=="Mul":
             left_tree = sympy_to_tree(sympy_expr[0], "Mul")
             if len(sympy_expr)>2:
                 right_tree = sympy_to_tree(sympy_expr[1:], "Mul")
             else:
                 right_tree = sympy_to_tree(sympy_expr[1], "Mul")
-            return ["*",left_tree,right_tree]
+            return [Node(lambda x, y: x * y, "*"),left_tree,right_tree]
     
 def simplify_tree(tree: list):
     "Simplifies a tree by transforming the tree to sympy format and reconstructing it"

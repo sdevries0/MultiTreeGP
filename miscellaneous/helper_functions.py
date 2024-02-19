@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from typing import Sequence
-from expression import Expression
+from miscellaneous.expression import Expression
 
 def index_loc(tree: list, path: list):
     "Returns subtree at location specified by indices"
