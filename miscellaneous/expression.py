@@ -3,9 +3,10 @@ import jax
 import jax.numpy as jnp
 
 class Node:
-    def __init__(self, f, string):
+    def __init__(self, f, string, arity):
         self.f = f
         self.string = string
+        self.arity = arity
 
     def __str__(self) -> str:
         return self.string
@@ -29,31 +30,39 @@ class Expression:
             control_variables (list[string]): Variables that represent control signals
     """
 
-    def __init__(self, obs_size = 0, state_size = 0, control_size = 0, target_size = 0, condition = None):
-        plus = Node(lambda x, y: x + y, "+")
-        minus = Node(lambda x, y: x - y, "-")
-        multiplication = Node(lambda x, y: x * y, "*")
-        division = Node(lambda x, y: x / y, "/")
-        power = Node(lambda x, y: x ** y, "**")
-        self.binary_operators = [plus, minus, multiplication, division, power]
+    def __init__(self, obs_size = 0, state_size = 0, control_size = 0, target_size = 0, include_unary = False, condition = None, operators_prob = None, leaf_prob = None):
+        plus = Node(lambda x, y: x + y, "+", 2)
+        minus = Node(lambda x, y: x - y, "-", 2)
+        multiplication = Node(lambda x, y: x * y, "*", 2)
+        division = Node(lambda x, y: x / y, "/", 2)
+        power = Node(lambda x, y: x ** y, "**", 2)
+        self.operators = [plus, minus, multiplication, division, power]
 
-        sine = Node(lambda x: jnp.sin(x), "sin")
-        cosine = Node(lambda x: jnp.cos(x), "cos")
-        tanh = Node(lambda x: jnp.tanh(x), "tanh")
-        exp = Node(lambda x: jnp.exp(x), "exp")
-        squareroot = Node(lambda x: jnp.sqrt(x), "√")
-        self.unary_operators= [sine, cosine]
+        if include_unary:
+            sine = Node(lambda x: jnp.sin(x), "sin", 1)
+            cosine = Node(lambda x: jnp.cos(x), "cos", 1)
+            tanh = Node(lambda x: jnp.tanh(x), "tanh", 1)
+            exp = Node(lambda x: jnp.exp(x), "exp", 1)
+            squareroot = Node(lambda x: jnp.sqrt(x), "√", 1)
+            self.operators.extend([sine, cosine])
+
+        if operators_prob is None:
+            self.operators_prob = jnp.ones(len(self.operators))
+        else:
+            assert len(operators_prob) == len(self.operators), "Length of probabilities does not match the number of operators"
+            self.operators_prob = operators_prob
+            
 
         self.leaf_nodes = []
         if obs_size > 0:
-            self.leaf_nodes.extend([Node(lambda args: args["y"][i], "y" + str(i)) for i in range(obs_size)])
+            self.leaf_nodes.extend([Node(lambda args: args["y"][i], "y" + str(i), 0) for i in range(obs_size)])
         if state_size > 0:
-            self.state_variables = [Node(lambda args: args["a"][i], "a" + str(i)) for i in range(state_size)]
+            self.state_variables = [Node(lambda args: args["a"][i], "a" + str(i), 0) for i in range(state_size)]
             self.leaf_nodes.extend(self.state_variables)
         if control_size > 0:
-            self.leaf_nodes.extend([Node(lambda args: args["u"][i], "u" + str(i)) for i in range(control_size)])
+            self.leaf_nodes.extend([Node(lambda args: args["u"][i], "u" + str(i), 0) for i in range(control_size)])
         if target_size > 0:
-            self.leaf_nodes.extend([Node(lambda args: args["tar"][i], "tar" + str(i)) for i in range(target_size)])
+            self.leaf_nodes.extend([Node(lambda args: args["tar"][i], "tar" + str(i), 0) for i in range(target_size)])
 
         if condition:
             self.condition = lambda tree: condition(self, tree)

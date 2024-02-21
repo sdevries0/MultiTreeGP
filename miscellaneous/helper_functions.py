@@ -19,11 +19,11 @@ def key_loc(tree: list, path: list):
 
 def is_operator(symbol, expressions: Expression):
     "Checks if node is an operator"
-    return symbol in expressions.binary_operators or symbol in expressions.unary_operators
+    return symbol in expressions.operators
 
 def is_leaf(symbol, expressions: Expression):
     "Checks if node is a leaf"
-    return symbol not in expressions.binary_operators and symbol not in expressions.unary_operators
+    return symbol not in expressions.operators
 
 def is_constant(symbol):
     "Checks if node is a constant"

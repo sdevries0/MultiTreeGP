@@ -20,7 +20,7 @@ def force_bitcast_convert_type(val, new_type=jnp.int32):
     return jax.lax.bitcast_convert_type(val, new_type)
 
 class EnvironmentBase(abc.ABC):
-    def __init__(self, sigma, obs_noise, n_obs, n_var, n_control, n_dim):
+    def __init__(self, sigma, obs_noise, n_var, n_control, n_dim, n_obs = None):
         self.sigma = sigma
         self.obs_noise = obs_noise
         self.n_var = n_var
@@ -59,7 +59,7 @@ class EnvironmentBase(abc.ABC):
 
     @abc.abstractmethod
     def fitness_function(self, state, control, target, ts):
-        return 100
+        return
 
     def terminate_event(self, state, **kwargs):
         return False

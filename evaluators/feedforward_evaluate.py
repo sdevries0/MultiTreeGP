@@ -10,15 +10,15 @@ class Evaluator:
     def __init__(self, env, state_size) -> None:
         self.env = env
         self.max_fitness = 1e6
-        self.state_size = state_size
         self.latent_size = env.n_var
 
-    def __call__(self, model, data) -> float:
-        _, _, _, _, fitness = self.evaluate_model(model, data)
+    def __call__(self, model, data) -> float:        
+        _, _, _, fitness = self.evaluate_model(model, data)
 
-        nan_or_inf =  jax.vmap(lambda f: jnp.isinf(f) + jnp.isnan(f))(fitness)
-        fitness = jnp.where(nan_or_inf, jnp.ones(fitness.shape)*self.max_fitness, fitness)
         fitness = jnp.mean(fitness)
+
+        if jnp.isinf(fitness) or jnp.isnan(fitness):
+            fitness = jnp.array(self.max_fitness)
         return jnp.clip(fitness,0,self.max_fitness)
     
     def evaluate_model(self, model, data):
@@ -46,45 +46,37 @@ class Evaluator:
         env = copy.copy(self.env)
         env.initialize_parameters(params, ts)
 
-        state_equation, readout = model
+        policy = model[0]
 
         #Define state equation
-        def _drift(t, x_a, args):
-            x = x_a[:self.latent_size]
-            a = x_a[self.latent_size:]
-
+        def _drift(t, x, args):
             _, y = env.f_obs(obs_noise_key, (t, x)) #Get observations from system
-            u = readout({"y":y, "a":a, "tar":target}) #Readout control from hidden state
+            u = policy({"y":y, "tar":target}) #Readout control from hidden state
 
             dx = env.drift(t, x, u) #Apply control to system and get system change
-            da = state_equation({"y":y, "a":a, "u":u, "tar":target}) #Compute hidden state updates
-            return jnp.concatenate([dx, da])
+            return dx
         
         #Define diffusion
-        def _diffusion(t, x_a, args):
-            x = x_a[:self.latent_size]
-            a = x_a[self.latent_size:]
+        def _diffusion(t, x, args):
             _, y = env.f_obs(obs_noise_key, (t, x))
-            u = readout({"y":y, "a":a, "tar":target})
+            u = policy({"y":y, "tar":target})
             # u = a
-            return jnp.concatenate([env.diffusion(t, x, u), jnp.zeros((self.state_size, self.latent_size))]) #Only the system is stochastic
+            return env.diffusion(t, x, u)
         
         solver = diffrax.EulerHeun()
         dt0 = 0.005
         saveat = diffrax.SaveAt(ts=ts)
-        _x0 = jnp.concatenate([x0, jnp.zeros(self.state_size)])
 
         brownian_motion = diffrax.UnsafeBrownianPath(shape=(self.latent_size,), key=process_noise_key)
         system = diffrax.MultiTerm(diffrax.ODETerm(_drift), diffrax.ControlTerm(_diffusion, brownian_motion))
         sol = diffrax.diffeqsolve(
-            system, solver, ts[0], ts[-1], dt0, _x0, saveat=saveat, adjoint=diffrax.DirectAdjoint(), max_steps=16**4, discrete_terminating_event=self.env.terminate_event
+            system, solver, ts[0], ts[-1], dt0, x0, saveat=saveat, adjoint=diffrax.DirectAdjoint(), max_steps=16**4, discrete_terminating_event=self.env.terminate_event
         )
 
-        xs = sol.ys[:,:self.latent_size]
+        xs = sol.ys
         _, ys = jax.lax.scan(env.f_obs, obs_noise_key, (ts, xs))
-        activities = sol.ys[:,self.latent_size:]
-        us = jax.vmap(lambda y, a, t: readout({"y":y, "a":a, "tar":target}), in_axes=[0,0,None])(ys, activities, target)
+        us = jax.vmap(lambda y, tar: policy({"y":y, "tar":tar}), in_axes=[0,None])(ys, target)
 
         fitness = env.fitness_function(xs, us, target, ts)
 
-        return xs, ys, us, activities, fitness
+        return xs, ys, us, fitness

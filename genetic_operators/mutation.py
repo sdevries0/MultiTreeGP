@@ -8,7 +8,7 @@ from miscellaneous.expression import Expression
 import miscellaneous.helper_functions as helper_functions
 import genetic_operators.initialization as initialization
 
-def insert_operator(expressions: Expression, tree: list, key: PRNGKey, unary_operators_prob: float = 0.0):
+def insert_operator(expressions: Expression, tree: list, key: PRNGKey):
     "Insert an operator at a random point in tree. Sample a new leaf if necessary to satisfy arity of the operator"
     nodes = jax.tree_util.tree_leaves(tree)
     flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
@@ -19,23 +19,19 @@ def insert_operator(expressions: Expression, tree: list, key: PRNGKey, unary_ope
     path = flat_tree_and_path[index][0][:-1]
     subtree = helper_functions.key_loc(tree, path)
     
-    key, new_key = jrandom.split(key)
-    operator_type = jrandom.uniform(new_key)
-    if operator_type>1-unary_operators_prob: #unary operator
-        key, new_key = jrandom.split(key)
-        new_operator = expressions.unary_operators[jrandom.randint(new_key, shape=(), minval=0, maxval=len(expressions.unary_operators))]
-        new_tree = [new_operator, subtree]
-    else: #binary operator
-        key, new_key1, new_key2, new_key3 = jrandom.split(key, 4)
-        new_operator = expressions.binary_operators[jrandom.randint(new_key1, shape=(), minval=0, maxval=len(expressions.binary_operators))]
-        tree_position = jrandom.randint(new_key2, shape=(), minval=0, maxval=2)
-        #Sample leaf for other child of operator
-        other_leaf = initialization.sample_leaf(new_key3, expressions)
+    new_key1, new_key2, new_key3 = jrandom.split(key, 3)
+    new_operator = expressions.operators[jrandom.choice(new_key1, a = jnp.arange(len(expressions.operators)), shape=(), p = expressions.operators_prob)]
 
+    if new_operator.arity == 2:
+        tree_position = jrandom.randint(new_key2, shape=(), minval=0, maxval=2)
+        other_leaf = initialization.sample_leaf(new_key3, expressions)
         new_tree = [new_operator, subtree, other_leaf] if (tree_position == 0) else [new_operator, other_leaf, subtree]
+    elif new_operator.arity == 1:
+        new_tree = [new_operator, subtree]
+        
     return eqx.tree_at(lambda t: helper_functions.key_loc(t, path), tree, new_tree)
 
-def add_subtree(expressions: Expression, tree: list, key: PRNGKey, unary_operators_prob: int = 0.0):
+def add_subtree(expressions: Expression, tree: list, key: PRNGKey):
     #Replace a leaf with a new subtree
     nodes = jax.tree_util.tree_leaves(tree)
     flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
@@ -44,7 +40,7 @@ def add_subtree(expressions: Expression, tree: list, key: PRNGKey, unary_operato
     key, new_key1, new_key2 = jrandom.split(key, 3)
     index = jrandom.choice(new_key1, leaf_indices)
     path = flat_tree_and_path[index][0][:-1]
-    return eqx.tree_at(lambda t: helper_functions.key_loc(t, path), tree, initialization.grow_node(new_key2, expressions, depth=3, unary_operators_prob = unary_operators_prob))
+    return eqx.tree_at(lambda t: helper_functions.key_loc(t, path), tree, initialization.grow_node(new_key2, expressions, depth=3))
 
 def mutate_operator(expressions: Expression, tree: list, key: PRNGKey):
     "Replace an operator with different operator of equal arity"
@@ -57,33 +53,31 @@ def mutate_operator(expressions: Expression, tree: list, key: PRNGKey):
     symbol = flat_tree_and_path[index][1]
     path = flat_tree_and_path[index][0]
 
-    if symbol in expressions.binary_operators:
-        bin_copy = expressions.binary_operators.copy()
+    if symbol.arity == 2:
+        bin_copy = [node for node in expressions.operators if node.arity == 2]
         bin_copy.remove(symbol)
         key, new_key = jrandom.split(key)
         new_operator = bin_copy[jrandom.randint(new_key, shape=(), minval=0, maxval=len(bin_copy))]
         new_tree = eqx.tree_at(lambda t: helper_functions.key_loc(t, path), tree, new_operator)
-    elif symbol in expressions.unary_operators:
-        un_copy = expressions.unary_operators.copy()
+    else:
+        un_copy = [node for node in expressions.operators if node.arity == 1]
         un_copy.remove(symbol)
         key, new_key = jrandom.split(key)
         new_operator = un_copy[jrandom.randint(new_key, shape=(), minval=0, maxval=len(un_copy))]
         new_tree = eqx.tree_at(lambda t: helper_functions.key_loc(t, path), tree, new_operator)
     return eqx.tree_at(lambda t: t, tree, new_tree)
 
-def prepend_operator(expressions: Expression, tree: list, key: PRNGKey, unary_operators_prob: float = 0.0):
+def prepend_operator(expressions: Expression, tree: list, key: PRNGKey):
     "Add an operator to the top of the tree"
     key, new_key = jrandom.split(key)
-    if jrandom.uniform(new_key)>1-unary_operators_prob:
-        key, new_key = jrandom.split(key)
-        new_operator = expressions.unary_operators[jrandom.randint(new_key, shape=(), minval=0, maxval=len(expressions.unary_operators))]
+    new_operator = expressions.operators[jrandom.choice(new_key, a = jnp.arange(len(expressions.operators)), shape=(), p = expressions.operators_prob)]
+    if new_operator.arity == 1:
         new_tree = [new_operator, tree]
     else:
-        key, new_key1, new_key2, new_key3 = jrandom.split(key, 4)
-        new_operator = expressions.binary_operators[jrandom.randint(new_key1, shape=(), minval=0, maxval=len(expressions.binary_operators))]
-        tree_position = jrandom.randint(new_key2, shape=(), minval=0, maxval=2)
+        new_key1, new_key2 = jrandom.split(key, 2)
+        tree_position = jrandom.randint(new_key1, shape=(), minval=0, maxval=2)
         #Sample a leaf for the other child of the operator
-        other_leaf = initialization.sample_leaf(new_key3, expressions)
+        other_leaf = initialization.sample_leaf(new_key2, expressions)
 
         new_tree = [new_operator, tree, other_leaf] if (tree_position == 0) else [new_operator, other_leaf, tree]
     return eqx.tree_at(lambda t: t, tree, new_tree)
@@ -133,7 +127,7 @@ def delete_operator(expressions: Expression, tree: list, key: PRNGKey):
 
     return eqx.tree_at(lambda t: helper_functions.key_loc(t, path), tree, new_leaf)
 
-def mutate_tree(mutation_probabilities: Array, expressions: Expression, tree: list, key: PRNGKey, max_init_depth: int, unary_operators_prob: int):
+def mutate_tree(mutation_probabilities: Array, expressions: Expression, tree: list, key: PRNGKey, max_init_depth: int):
     #Applies on of the mutation types to a tree
     _mutation_probabilities = mutation_probabilities.copy()
 
@@ -160,12 +154,12 @@ def mutate_tree(mutation_probabilities: Array, expressions: Expression, tree: li
     elif mutation_type=="mutate_leaf":
         new_tree = mutate_leaf(expressions, tree, new_key2)
     elif mutation_type=="sample_subtree":
-        new_tree = initialization.grow_node(new_key2, expressions, depth=max_init_depth, unary_operators_prob = unary_operators_prob)
+        new_tree = initialization.grow_node(new_key2, expressions, depth=max_init_depth)
     elif mutation_type=="add_subtree":
-        new_tree = add_subtree(expressions, tree, new_key2, unary_operators_prob = unary_operators_prob)        
+        new_tree = add_subtree(expressions, tree, new_key2)        
     return new_tree
 
-def mutate_trees(parent: list, layer_sizes, key: PRNGKey, reproduction_probability: float, mutation_probabilities: Array, expressions: Expression, max_init_depth: int, unary_operators_prob: int = 0.0):
+def mutate_trees(parent: list, layer_sizes, key: PRNGKey, reproduction_probability: float, mutation_probabilities: Array, expressions: Expression, max_init_depth: int):
     key, new_key = jrandom.split(key)
     mutate_bool = jrandom.bernoulli(new_key, p = reproduction_probability, shape=(jnp.sum(layer_sizes),))
     while jnp.sum(mutate_bool)==0: #Make sure that at least one tree is mutated
@@ -182,6 +176,6 @@ def mutate_trees(parent: list, layer_sizes, key: PRNGKey, reproduction_probabili
 
             if mutate_bool[index]:
                 key, new_key = jrandom.split(key)
-                new_tree = mutate_tree(mutation_probabilities, expressions[i], parent()[i][j], key, max_init_depth, unary_operators_prob)
+                new_tree = mutate_tree(mutation_probabilities, expressions[i], parent()[i][j], key, max_init_depth)
                 child = eqx.tree_at(lambda t: t()[i][j], child, new_tree)
     return child

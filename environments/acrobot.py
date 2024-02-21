@@ -4,13 +4,13 @@ import jax.random as jrandom
 from environments.environment_base import EnvironmentBase
 
 class Acrobot(EnvironmentBase):
-    def __init__(self, sigma, obs_noise, n_obs):
+    def __init__(self, sigma, obs_noise, n_obs = None):
         self.n_var = 4
         self.n_control = 1
         self.n_targets = 0
         self.n_dim = 1
         self.init_bounds = jnp.array([0.1,0.1,0.1,0.1])
-        super().__init__(sigma, obs_noise, n_obs, self.n_var, self.n_control, self.n_dim)
+        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
 
         self.Q = jnp.array(0.0)
         self.R = jnp.array([[0.0]])
@@ -36,7 +36,7 @@ class Acrobot(EnvironmentBase):
         self.moi1 = self.moi2 = 1.0
         self.g = 9.81
 
-        self.G = jnp.array([[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,1]])
+        self.G = jnp.array([[0,0,0,0],[0,0,0,0],[0,0,1,0],[0,0,0,1]])
         self.V = self.sigma*self.G
 
         self.C = jnp.eye(self.n_var)[:self.n_obs]
@@ -73,7 +73,7 @@ class Acrobot(EnvironmentBase):
         # w2 = 1
 
         # invalid_points = jax.vmap(lambda _x, _u: jnp.any(jnp.isinf(_x)) + jnp.isnan(_u))(state, control[:,0])
-        # reached_threshold = jax.vmap(lambda theta1, theta2: -jnp.cos(theta1) - jnp.cos(theta1 + theta2) > 0.5)(state[:,0], state[:,1])
+        reached_threshold = jax.vmap(lambda theta1, theta2: -jnp.cos(theta1) - jnp.cos(theta1 + theta2) > 1.0)(state[:,0], state[:,1])
         # angle_distance = jax.vmap(lambda theta1, theta2: (2 + jnp.cos(theta1) + jnp.cos(theta1 + theta2))/4)(state[:,0], state[:,1])
         # costs = jnp.where(invalid_points, jnp.ones_like(ts), angle_distance)
 
@@ -85,17 +85,17 @@ class Acrobot(EnvironmentBase):
         # control_cost = jax.vmap(lambda _state, _u: _u@self.R@_u)(state, control)
         # costs = jnp.where((ts/(ts[1]-ts[0]))>first_success, jnp.zeros_like(control_cost), control_cost)
 
-        # first_success = jnp.argmax(reached_threshold)
-        # return first_success + (first_success == 0) * ts.shape[0]  # + jnp.sum(costs)
+        first_success = jnp.argmax(reached_threshold)
+        return first_success + (first_success == 0) * ts.shape[0]  # + jnp.sum(costs)
 
-        invalid_points = jax.vmap(lambda _x, _u: jnp.any(jnp.isinf(_x)) + jnp.isnan(_u))(state, control[:,0])
-        angle_distance = jax.vmap(lambda theta1, theta2: ((2 + jnp.cos(theta1) + jnp.cos(theta1 + theta2))/4)**2)(state[:,0], state[:,1])
-        angle_costs = jnp.where(invalid_points, jnp.ones_like(ts), angle_distance)
-        reached_threshold = jax.vmap(lambda theta1, theta2: -jnp.cos(theta1) - jnp.cos(theta1 + theta2) > 0.0)(state[:,0], state[:,1])
-        first_success = jnp.argmax(reached_threshold) + (jnp.sum(reached_threshold)==0) * ts.shape[0]
-        costs = jnp.where((ts/(ts[1]-ts[0]))<first_success, jnp.ones_like(angle_costs), angle_costs)
+        # invalid_points = jax.vmap(lambda _x, _u: jnp.any(jnp.isinf(_x)) + jnp.isnan(_u))(state, control[:,0])
+        # angle_distance = jax.vmap(lambda theta1, theta2: ((2 + jnp.cos(theta1) + jnp.cos(theta1 + theta2))/4)**2)(state[:,0], state[:,1])
+        # angle_costs = jnp.where(invalid_points, jnp.ones_like(ts), angle_distance)
+        # reached_threshold = jax.vmap(lambda theta1, theta2: -jnp.cos(theta1) - jnp.cos(theta1 + theta2) > 0.0)(state[:,0], state[:,1])
+        # first_success = jnp.argmax(reached_threshold) + (jnp.sum(reached_threshold)==0) * ts.shape[0]
+        # costs = jnp.where((ts/(ts[1]-ts[0]))<first_success, jnp.ones_like(angle_costs), angle_costs)
 
-        return jnp.sum(costs)
+        # return jnp.sum(costs)
 
     def terminate_event(self, state, **kwargs):
         return (jnp.abs(state.y[2])>(4*jnp.pi)) | (jnp.abs(state.y[3])>(9*jnp.pi)) | jnp.any(jnp.isnan(state.y)) | jnp.any(jnp.isinf(state.y))

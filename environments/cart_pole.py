@@ -4,26 +4,26 @@ import jax.random as jrandom
 from environments.environment_base import EnvironmentBase
 
 class CartPole(EnvironmentBase):
-    def __init__(self, sigma, obs_noise, n_obs):
+    def __init__(self, sigma, obs_noise, n_obs = None):
         self.n_var = 4
         self.n_control = 1
         self.n_targets = 0
         self.n_dim = 1
         self.init_bounds = jnp.array([0.05,0.05,0.05,0.05])
-        super().__init__(sigma, obs_noise, n_obs, self.n_var, self.n_control, self.n_dim)
+        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
 
         self.Q = jnp.array(0)
         self.R = jnp.array([[0.0]])
 
     def sample_init_states(self, batch_size, key):
         init_key, target_key = jrandom.split(key)
-        x0 = jrandom.uniform(key, shape=(batch_size, self.n_var), minval= -self.init_bounds, maxval= self.init_bounds)
+        x0 = jrandom.uniform(init_key, shape=(batch_size, self.n_var), minval= -self.init_bounds, maxval= self.init_bounds)
         targets = jnp.zeros((batch_size, self.n_targets))
         return x0, targets
     
     def sample_params(self, batch_size, mode, ts, key):
         #g, mass, length
-        pass
+        return jnp.zeros((batch_size))
 
     def initialize_parameters(self, params, ts):
         _ = params
@@ -66,19 +66,9 @@ class CartPole(EnvironmentBase):
     def diffusion(self, t, x, args):
         return self.V
     
-    def fitness_function(self, state, u, target, ts):
-        # u = jnp.squeeze(u)
-        # x_d = jnp.array([target,0])
-        # angle_rewards = jnp.abs(state[:,2])<self.threshold_theta
-        # position_rewards = jnp.abs(state[:,0])<self.threshold_x
-
-        # costs = jnp.cumsum(1.0-angle_rewards*position_rewards)# + 1e5*jnp.abs(u))
-        # return costs
-        # print(state[:,0], state[:,2], u)
-        invalid_points = jax.vmap(lambda _x, _u: jnp.any(jnp.isinf(_x)) + jnp.isnan(_u))(state, u[:,0])
-        # print(valid_points)
+    def fitness_function(self, state, control, target, ts):
+        invalid_points = jax.vmap(lambda _x, _u: jnp.any(jnp.isinf(_x)) + jnp.isnan(_u))(state, control[:,0])
         punishment = jnp.ones_like(invalid_points)
-        # costs_angle = jax.vmap(lambda _state, _u: self.Q*(jnp.abs(_state[1])>0.1))(state, u)
         # costs_control = jax.vmap(lambda _state, _u: _u@self.R@_u)(state, u)
 
         costs = jnp.where(invalid_points, punishment, jnp.zeros_like(punishment))

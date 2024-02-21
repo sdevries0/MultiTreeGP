@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax.tree_util import register_pytree_node
+from genetic_operators.simplification import tree_to_string
 
 class NetworkTrees:
     """
@@ -59,7 +60,21 @@ class NetworkTrees:
                 params.append(value)
                 paths.append(path)
         return jnp.array(params), paths
-    
+        
+    def __str__(self) -> str:
+        string_output = ""
+        for i in range(len(self.trees)):
+            string_output += "["
+            layer = self.trees[i]
+            for j in range(len(layer)):
+                string_output += tree_to_string(layer[j])
+                if j < (len(layer) - 1):
+                    string_output += ", "
+            string_output += "]"
+            if i < (len(self.trees) - 1):
+                string_output += ", "
+        return string_output
+
 #Register the class of trees as a pytree
 register_pytree_node(NetworkTrees, lambda tree: ((tree()), None),
     lambda _, args: NetworkTrees(args))

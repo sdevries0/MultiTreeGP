@@ -5,14 +5,14 @@ import diffrax
 from environments.environment_base import EnvironmentBase
 
 class HarmonicOscillator(EnvironmentBase):
-    def __init__(self, sigma, obs_noise, n_obs):
+    def __init__(self, sigma, obs_noise, n_obs = None):
         self.n_dim = 1
         self.n_var = 2
         self.n_control = 1
         self.n_targets = 1
         self.mu0 = jnp.zeros(self.n_var)
         self.P0 = jnp.eye(self.n_var)
-        super().__init__(sigma, obs_noise, n_obs, self.n_var, self.n_control, self.n_dim)
+        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
 
         self.q = self.r = 0.5
         self.Q = jnp.array([[self.q,0],[0,0]])
