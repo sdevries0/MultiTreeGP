@@ -8,6 +8,7 @@ import diffrax
 class Evaluator:
     def __init__(self, env):
         self.env = env
+        self.latent_size = env.n_var*env.n_dim
 
     def compute_ricatti(self, A, b, Q, R):
         def _f(t,x,args):
@@ -69,7 +70,7 @@ class Evaluator:
         u = jax.vmap(lambda m, l: -l@(m-x_star) + u_star, in_axes=[0,None])(mu, L) #Map states to control
         _, y = jax.lax.scan(env.f_obs, obs_noise_key, (ts, x)) #Map states to observations
 
-        costs = env.fitness_function(x, u, target)
+        costs = env.fitness_function(x, u, target, ts)
 
         return x, y, u, costs
 

@@ -83,7 +83,7 @@ class Evaluator:
         xs = sol.ys[:,:self.latent_size]
         _, ys = jax.lax.scan(env.f_obs, obs_noise_key, (ts, xs))
         activities = sol.ys[:,self.latent_size:]
-        us = jax.vmap(lambda y, a, t: readout({"y":y, "a":a, "tar":target}), in_axes=[0,0,None])(ys, activities, target)
+        us = jax.vmap(lambda y, a, tar: readout({"y":y, "a":a, "tar":tar}), in_axes=[0,0,None])(ys, activities, target)
 
         fitness = env.fitness_function(xs, us, target, ts)
 
