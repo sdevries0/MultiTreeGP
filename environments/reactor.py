@@ -11,12 +11,14 @@ class StirredTankReactor(EnvironmentBase):
         self.n_control = 1
         self.n_dim = 1
         self.n_targets = 1
-        self.init_lower_bounds = jnp.array([200, 200, 0.0])
-        self.init_upper_bounds = jnp.array([300, 400, 1.0])
-        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
+        self.init_lower_bounds = jnp.array([200, 200, 0.1])
+        self.init_upper_bounds = jnp.array([300, 400, 0.9])
+        self.default_obs = 3
+        self.obs_bounds = (jnp.array([-jnp.inf, -jnp.inf, 0]), jnp.array([jnp.inf, jnp.inf, 1]))
+        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, self.obs_bounds, n_obs if n_obs else self.default_obs)
 
         self.Q = jnp.array([[0,0,0],[0,0.01,0],[0,0,0]])
-        self.r = jnp.array([[0.]])
+        self.r = jnp.array([[0.0000]])
 
     def initialize_parameters(self, params, ts):
         self.k0 = 7.2 * 10e10 #Arrehnius pre-exponential
@@ -40,7 +42,7 @@ class StirredTankReactor(EnvironmentBase):
         self.Tcf = 200 #coolant feed temperature
         self.Vol_c = 20 #cooling jacket volume
 
-        self.G = jnp.eye(self.n_var)*jnp.array([50, 50, 0.1])
+        self.G = jnp.eye(self.n_var)*jnp.array([20, 20, 0.5])
         self.V = self.sigma*self.G
 
         self.C = jnp.eye(self.n_var)[:self.n_obs]
@@ -49,7 +51,7 @@ class StirredTankReactor(EnvironmentBase):
     def sample_init_states(self, batch_size, key):
         init_key, target_key = jrandom.split(key)
         x0 = jrandom.uniform(init_key, shape=(batch_size, self.n_var), minval= self.init_lower_bounds, maxval= self.init_upper_bounds)
-        targets = jrandom.uniform(target_key, shape=(batch_size, self.n_targets), minval=250, maxval=350)
+        targets = jrandom.uniform(target_key, shape=(batch_size, self.n_targets), minval=250, maxval=400)
         return x0, targets
 
     def sample_params(self, batch_size, mode, ts, key):

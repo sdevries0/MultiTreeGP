@@ -10,7 +10,9 @@ class Acrobot(EnvironmentBase):
         self.n_targets = 0
         self.n_dim = 1
         self.init_bounds = jnp.array([0.1,0.1,0.1,0.1])
-        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
+        self.default_obs = 6
+        self.obs_bounds = (-jnp.array([1, 1, 1, 1, jnp.inf, jnp.inf]), jnp.array([1, 1, 1, 1, jnp.inf, jnp.inf]))
+        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, self.obs_bounds, n_obs if n_obs else self.default_obs)
 
         self.Q = jnp.array(0.0)
         self.R = jnp.array([[0.0]])
@@ -24,6 +26,12 @@ class Acrobot(EnvironmentBase):
     def sample_params(self, batch_size, mode, ts, key):
         #g, l1, l2, m1, m2, lc1, lc2
         return jnp.zeros(batch_size)
+    
+    def f_obs(self, key, t_x):
+        t, x = t_x
+        x_ = jnp.array([jnp.cos(x[0]), jnp.sin(x[0]), jnp.cos(x[1]), jnp.sin(x[1]), x[2], x[3]])
+        new_key, out = super().f_obs(key, (t, x_))
+        return key, out
 
     def initialize_parameters(self, params, ts):
         _ = params
@@ -39,8 +47,8 @@ class Acrobot(EnvironmentBase):
         self.G = jnp.array([[0,0,0,0],[0,0,0,0],[0,0,1,0],[0,0,0,1]])
         self.V = self.sigma*self.G
 
-        self.C = jnp.eye(self.n_var)[:self.n_obs]
-        self.W = self.obs_noise*jnp.eye(self.n_obs)
+        self.C = jnp.eye(6)[:self.n_obs]
+        self.W = self.obs_noise*jnp.eye(self.n_obs)*(jnp.array([0.5,0.5,0.5,0.5,1,1])[:self.n_obs])
     
     def drift(self, t, state, args):
         control = jnp.squeeze(args)
@@ -73,7 +81,7 @@ class Acrobot(EnvironmentBase):
         # w2 = 1
 
         # invalid_points = jax.vmap(lambda _x, _u: jnp.any(jnp.isinf(_x)) + jnp.isnan(_u))(state, control[:,0])
-        reached_threshold = jax.vmap(lambda theta1, theta2: -jnp.cos(theta1) - jnp.cos(theta1 + theta2) > 1.0)(state[:,0], state[:,1])
+        reached_threshold = jax.vmap(lambda theta1, theta2: -jnp.cos(theta1) - jnp.cos(theta1 + theta2) > 1.5)(state[:,0], state[:,1])
         # angle_distance = jax.vmap(lambda theta1, theta2: (2 + jnp.cos(theta1) + jnp.cos(theta1 + theta2))/4)(state[:,0], state[:,1])
         # costs = jnp.where(invalid_points, jnp.ones_like(ts), angle_distance)
 

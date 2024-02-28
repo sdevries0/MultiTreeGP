@@ -52,10 +52,3 @@ def best_solution(populations: list, fitnesses: Sequence):
             best_fitness = jnp.min(fitnesses[pop])
             best_solution = populations[pop][jnp.argmin(fitnesses[pop])]
     return best_solution
-
-def get_root(tree: list):
-    "Returns the type of the root of a tree"
-    root = tree()[0]
-    if isinstance(root, jax.numpy.ndarray):
-        root = "Constant"
-    return root

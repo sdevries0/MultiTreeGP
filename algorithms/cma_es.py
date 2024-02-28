@@ -6,7 +6,7 @@ from algorithms.strategy_base import Strategy
 class CMA_ES(Strategy):
     def __init__(self, num_generations, population_size, fitness_function, num_dims, key) -> None:
         super().__init__(num_generations, population_size, fitness_function)
-        self.cma_strategy = evosax.CMA_ES(popsize = population_size, num_dims = num_dims)
+        self.cma_strategy = evosax.CMA_ES(popsize = population_size, num_dims = num_dims, elite_ratio=0.1)
         self.cma_state = self.cma_strategy.initialize(key)
 
     def initialize_population(self, key):

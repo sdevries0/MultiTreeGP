@@ -89,6 +89,7 @@ class RandomSearch(Strategy):
         #Evaluate each solution parallely on a pool of workers
         new_populations = self.pool.amap(lambda x: self.update_population(keys[1+x]), range(self.num_populations))
         self.pool.close()
+        self.pool.join()
         return new_populations.get()
     
     def update_population(self, key):

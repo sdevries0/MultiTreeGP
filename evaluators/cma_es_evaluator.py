@@ -14,8 +14,7 @@ class Evaluator:
         self.state_size = state_size
         self.max_fitness = 1e6
         self.latent_size = self.env.n_var*self.env.n_dim
-        self.parameter_reshaper = ParameterReshaper(obs_space = self.env.n_obs, latent_size = state_size, action_space = self.env.n_control, 
-                                                    n_targets = self.env.n_targets, hidden_layer_sizes = [32])
+        self.parameter_reshaper = ParameterReshaper(obs_space = self.env.n_obs, latent_size = self.state_size, action_space = self.env.n_control, n_targets = self.env.n_targets)
         self.n_param = self.parameter_reshaper.total_parameters
 
     def evaluate_control_loop(self, model, x0: Sequence[float], ts: Sequence[float], target: float, process_noise_key: PRNGKey, obs_noise_key: PRNGKey, params: Tuple):
@@ -48,7 +47,7 @@ class Evaluator:
 
             # u = a
             dx = env.drift(t, x, u) #Apply control to system and get system change
-            da = model.update(jnp.concatenate([y, a])) #Compute hidden state updates
+            da = model.update(y, a, u, target) #Compute hidden state updates
 
             return jnp.concatenate([dx, da])
         

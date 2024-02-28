@@ -80,37 +80,34 @@ register_pytree_node(NetworkTrees, lambda tree: ((tree()), None),
     lambda _, args: NetworkTrees(args))
 
 class RNN:
-    def __init__(self, layers, action_layer) -> None:
-        self.layers = layers
+    def __init__(self, input_layer, recurrent, bias, action_layer, action_bias) -> None:
+        self.input_layer = input_layer
+        self.recurrent = recurrent
+        self.bias = bias
         self.action_layer = action_layer
+        self.action_bias = action_bias
 
-    def update(self, x):
-        for layer in self.layers:
-            w, b = layer
-            x = jnp.tanh(w@x + b)
-
+    def update(self, y, a, u, target):
+        x = jnp.concatenate([y, u, target])
+        x = jnp.tanh(self.input_layer@x + self.recurrent@a + self.bias)
         return x
     
     def act(self, a, target):
         x = jnp.concatenate([a, target])
-        w, b = self.action_layer
 
-        return w@x + b
+        return self.action_layer@x + self.action_bias
     
 class ParameterReshaper:
-    def __init__(self, obs_space, latent_size, action_space, n_targets, hidden_layer_sizes):
-        self.first_layer_shape = (obs_space + latent_size, hidden_layer_sizes[0])
-        self.hidden_layers_shape = []
-        if len(hidden_layer_sizes)>1:
-            for i in range(len(hidden_layer_sizes)-1):
-                self.hidden_layers_shape.append((hidden_layer_sizes[i], hidden_layer_sizes[i+1]))
+    def __init__(self, obs_space, latent_size, action_space, n_targets):
+        self.input_layer_shape = (obs_space + action_space + n_targets, latent_size)
+        self.recurrent_layer_shape = (latent_size, latent_size)
+        self.bias_shape = (latent_size,)
 
-        self.latent_layer_shape = (hidden_layer_sizes[-1], latent_size)
         self.action_layer_shape = (latent_size + n_targets, action_space)
+        self.action_bias_shape = (action_space,)
 
-        self.nr_hidden_layers = len(hidden_layer_sizes)-1
-
-        self.total_parameters = jnp.sum(jnp.array([*map(lambda l: l[0]*l[1] + l[1], self.hidden_layers_shape + [self.first_layer_shape, self.latent_layer_shape, self.action_layer_shape])]))
+        self.total_parameters = jnp.sum(jnp.array([*map(lambda l: l[0]*l[1], [self.input_layer_shape, self.recurrent_layer_shape, self.action_layer_shape])])) \
+                            + jnp.sum(jnp.array([*map(lambda l: l[0], [self.bias_shape, self.action_bias_shape])]))
 
         print("Total number of parameters: ", self.total_parameters)
 
@@ -118,32 +115,26 @@ class ParameterReshaper:
         assert params.shape[0] == self.total_parameters
 
         index = 0
+        layers = []
 
-        w = params[index:index+self.first_layer_shape[0]*self.first_layer_shape[1]].reshape(self.first_layer_shape[1], self.first_layer_shape[0])
-        index += self.first_layer_shape[0]*self.first_layer_shape[1]
-        b = params[index:index+self.first_layer_shape[1]]
-        index += self.first_layer_shape[1]
-        first_layer = [(w, b)]
+        w = params[index:index+self.input_layer_shape[0]*self.input_layer_shape[1]].reshape(self.input_layer_shape[1], self.input_layer_shape[0])
+        index += self.input_layer_shape[0]*self.input_layer_shape[1]
+        layers.append(w)
 
-        hidden_layers = []
-        if self.nr_hidden_layers>0:
-            for i in range(self.nr_hidden_layers):
-                w = params[index:index+self.hidden_layers_shape[i][0]*self.hidden_layers_shape[i][1]].reshape(self.hidden_layers_shape[i][1], self.hidden_layers_shape[i][0])
-                index += self.hidden_layers_shape[i][0]*self.hidden_layers_shape[i][1]
-                b = params[index:index+self.hidden_layers_shape[i][1]]
-                index += self.hidden_layers_shape[i][1]
-                hidden_layers.append((w,b))
+        w = params[index:index+self.recurrent_layer_shape[0]*self.recurrent_layer_shape[1]].reshape(self.recurrent_layer_shape[1], self.recurrent_layer_shape[0])
+        index += self.recurrent_layer_shape[0]*self.recurrent_layer_shape[1]
+        layers.append(w)
 
-        w = params[index:index+self.latent_layer_shape[0]*self.latent_layer_shape[1]].reshape(self.latent_layer_shape[1], self.latent_layer_shape[0])
-        index += self.latent_layer_shape[0]*self.latent_layer_shape[1]
-        b = params[index:index+self.latent_layer_shape[1]]
-        index += self.latent_layer_shape[1]
-        latent_layer = [(w, b)]
+        w = params[index:index+self.bias_shape[0]]
+        index += self.bias_shape[0]
+        layers.append(w)
 
         w = params[index:index+self.action_layer_shape[0]*self.action_layer_shape[1]].reshape(self.action_layer_shape[1], self.action_layer_shape[0])
         index += self.action_layer_shape[0]*self.action_layer_shape[1]
-        b = params[index:index+self.action_layer_shape[1]]
-        index += self.action_layer_shape[1]
-        action_layer = (w, b)
+        layers.append(w)
 
-        return first_layer + hidden_layers + latent_layer, action_layer
+        w = params[index:index+self.action_bias_shape[0]]
+        index += self.action_bias_shape[0]
+        layers.append(w)
+
+        return layers
