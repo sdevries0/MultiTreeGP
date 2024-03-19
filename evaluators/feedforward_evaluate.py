@@ -15,10 +15,9 @@ class Evaluator:
     def __call__(self, model, data) -> float:        
         _, _, _, fitness = self.evaluate_model(model, data)
 
+        nan_or_inf =  jax.vmap(lambda f: jnp.isinf(f) + jnp.isnan(f))(fitness)
+        fitness = jnp.where(nan_or_inf, jnp.ones(fitness.shape)*self.max_fitness, fitness)
         fitness = jnp.mean(fitness)
-
-        if jnp.isinf(fitness) or jnp.isnan(fitness):
-            fitness = jnp.array(self.max_fitness)
         return jnp.clip(fitness,0,self.max_fitness)
     
     def evaluate_model(self, model, data):

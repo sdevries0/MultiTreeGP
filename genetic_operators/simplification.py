@@ -52,6 +52,8 @@ def sympy_to_tree(sympy_expr, mode: str):
         return [jnp.array(0)]
     elif isinstance(sympy_expr,sympy.core.numbers.Half):
         return [jnp.array(0.5)]
+    elif isinstance(sympy_expr,sympy.core.numbers.Exp1):
+        return [jnp.exp(1)]
     elif isinstance(sympy_expr*-1, sympy.core.numbers.Rational):
         return [jnp.array(float(sympy_expr))]
     elif not isinstance(sympy_expr,tuple):
@@ -75,6 +77,10 @@ def sympy_to_tree(sympy_expr, mode: str):
             return [OperatorNode(lambda x: jnp.sin(x), "sin", 1),sympy_to_tree(sympy_expr.args[0], mode=None)]
         if isinstance(sympy_expr,sympy.tanh):
             return [OperatorNode(lambda x: jnp.tanh(x), "tanh", 1),sympy_to_tree(sympy_expr.args[0], mode=None)]
+        if isinstance(sympy_expr,sympy.log):
+            return [OperatorNode(lambda x: jnp.log(x), "log", 1),sympy_to_tree(sympy_expr.args[0], mode=None)]
+        if isinstance(sympy_expr,sympy.exp):
+            return [OperatorNode(lambda x: jnp.exp(x), "exp", 1),sympy_to_tree(sympy_expr.args[0], mode=None)]
         if isinstance(sympy_expr, sympy.Pow):
             if sympy_expr.args[1]==-1:
                 right_tree = sympy_to_tree(sympy_expr.args[0], "Mul")

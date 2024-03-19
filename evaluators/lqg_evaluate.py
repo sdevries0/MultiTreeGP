@@ -16,7 +16,7 @@ class Evaluator:
         
         system = diffrax.ODETerm(_f)
         sol = diffrax.diffeqsolve(
-            system, diffrax.Euler(), 0, 10, 0.01, jnp.zeros((2,2)), max_steps=16**4
+            system, diffrax.Euler(), 0, 10, 0.01, jnp.zeros_like(Q), max_steps=16**4
         )
         return sol.ys[0]
 

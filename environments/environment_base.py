@@ -20,13 +20,12 @@ def force_bitcast_convert_type(val, new_type=jnp.int32):
     return jax.lax.bitcast_convert_type(val, new_type)
 
 class EnvironmentBase(abc.ABC):
-    def __init__(self, sigma, obs_noise, n_var, n_control, n_dim, obs_bounds, n_obs):
+    def __init__(self, sigma, obs_noise, n_var, n_control, n_dim, n_obs):
         self.sigma = sigma
         self.obs_noise = obs_noise
         self.n_var = n_var
         self.n_control = n_control
         self.n_dim = n_dim
-        self.obs_bounds = obs_bounds
         self.n_obs = n_obs
 
     @abc.abstractmethod
@@ -44,8 +43,9 @@ class EnvironmentBase(abc.ABC):
     def f_obs(self, key, t_x):
         t, x = t_x
         new_key = jrandom.fold_in(key, force_bitcast_convert_type(t))
-        out = self.C@x + jrandom.normal(new_key, shape=(self.n_obs*self.n_dim,))@self.W
-        return key, jnp.clip(out, a_min = self.obs_bounds[0], a_max = self.obs_bounds[1])
+        # print(self.C.shape, x.shape)
+        out = self.C@x + jrandom.normal(new_key, shape=(self.n_obs,))@self.W
+        return key, out
     
     @abc.abstractmethod
     def drift(self, t, state, args):

@@ -109,8 +109,6 @@ class ParameterReshaper:
         self.total_parameters = jnp.sum(jnp.array([*map(lambda l: l[0]*l[1], [self.input_layer_shape, self.recurrent_layer_shape, self.action_layer_shape])])) \
                             + jnp.sum(jnp.array([*map(lambda l: l[0], [self.bias_shape, self.action_bias_shape])]))
 
-        print("Total number of parameters: ", self.total_parameters)
-
     def __call__(self, params):
         assert params.shape[0] == self.total_parameters
 

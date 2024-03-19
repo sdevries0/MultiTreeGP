@@ -11,7 +11,7 @@ class Evaluator:
         self.env = env
         self.max_fitness = 1e6
         self.state_size = state_size
-        self.latent_size = env.n_var
+        self.latent_size = env.n_var*env.n_dim
 
     def __call__(self, model, data) -> float:
         _, _, _, _, fitness = self.evaluate_model(model, data)
