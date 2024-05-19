@@ -1,16 +1,16 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
-from environments.environment_base import EnvironmentBase
+from environments.control_environments.control_environment_base import EnvironmentBase
 
 class CartPole(EnvironmentBase):
-    def __init__(self, sigma, obs_noise, n_obs = None):
+    def __init__(self, process_noise, obs_noise, n_obs = 4):
         self.n_var = 4
         self.n_control = 1
         self.n_targets = 0
         self.n_dim = 1
         self.init_bounds = jnp.array([0.05,0.05,0.05,0.05])
-        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
+        super().__init__(process_noise, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
 
         self.Q = jnp.array(0)
         self.R = jnp.array([[0.0]])
@@ -33,14 +33,14 @@ class CartPole(EnvironmentBase):
         self.cart_mass = 1
         
         self.G = jnp.array([[0,0,0,0],[0,0,0,0],[0,0,1,0],[0,0,0,0]])
-        self.V = self.sigma*self.G
+        self.V = self.process_noise*self.G
 
         self.C = jnp.eye(self.n_var)[:self.n_obs]
         self.W = self.obs_noise*jnp.eye(self.n_obs)
 
     def drift(self, t, state, args):
         control = jnp.squeeze(args)
-        control = 2*jnp.tanh(control)
+        control = jnp.clip(control, -1, 1)
         x, theta, x_dot, theta_dot = state
 
         cos_theta = jnp.cos(theta)

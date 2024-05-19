@@ -1,9 +1,14 @@
 import jax.numpy as jnp
 import sympy
-from miscellaneous.expression import OperatorNode, LeafNode
 
-def tree_to_string(tree: list):
-    "Transform tree to string"
+from expression import OperatorNode, LeafNode
+
+def tree_to_string(tree: list) -> str:
+    """Transform tree to string representation.
+
+    :param tree: Tree of operators and leaves.
+    :returns: String representation of tree.
+    """
     if len(tree)==3:
         left_tree = "(" + tree_to_string(tree[1]) + ")" if len(tree[1]) == 3 else tree_to_string(tree[1])
         right_tree = "(" + tree_to_string(tree[2]) + ")" if len(tree[2]) == 3 else tree_to_string(tree[2])
@@ -14,22 +19,24 @@ def tree_to_string(tree: list):
         return str(tree[0])
     
 #Simplification methods
-def tree_to_sympy(tree: list, eval: bool = True):
-    "Transforms a tree to sympy format"
+def tree_to_sympy(tree: list, eval: bool = True) -> sympy.core.Expr:
+    """Transforms a tree to sympy format.
+
+    :param tree: Tree of operators and leaves.
+    :param eval: Indicates if the trees should be simplified.
+    :returns: Sympy representation of tree.
+    """
     str_sol = tree_to_string(tree)
     expr = sympy.parsing.sympy_parser.parse_expr(str_sol, evaluate=eval)
     
     return expr
 
-def trees_to_sympy(trees: list):
-    "Transforms trees to sympy formats"
-    sympy_trees = []
-    for tree in trees:
-        sympy_trees.append(tree_to_sympy(tree))
-    return sympy_trees
+def replace_negatives(tree: list) -> list:
+    """Replaces '+-1.0*x' with '-x' to simplify trees even further.
 
-def replace_negatives(tree: list):
-    "Replaces '+-1.0*x' with '-x' to simplify trees even further"
+    :param tree: Tree of operators and leaves.
+    :returns: Simplified tree.
+    """
     if len(tree)<3:
         return tree
     left_tree = replace_negatives(tree[1])
@@ -39,8 +46,13 @@ def replace_negatives(tree: list):
         return [OperatorNode(lambda x, y: x - y, "-"), left_tree, right_tree[2]]
     return [tree[0], left_tree, right_tree]
 
-def sympy_to_tree(sympy_expr, mode: str):
-    "Reconstruct a tree from a sympy expression"
+def sympy_to_tree(sympy_expr: sympy.core.Expr, mode: str) -> list:
+    """Reconstruct a tree from a sympy expression.
+
+    :param sympy_expr: Sympy representation of a tree.
+    :param mode: Indicates if current subtree should be multiplied or added
+    :returns: Tree.
+    """
     if isinstance(sympy_expr,sympy.Float) or isinstance(sympy_expr,sympy.Integer):
         return [jnp.array(float(sympy_expr))]
     elif isinstance(sympy_expr,sympy.Symbol):
@@ -105,17 +117,24 @@ def sympy_to_tree(sympy_expr, mode: str):
                 right_tree = sympy_to_tree(sympy_expr[1], "Mul")
             return [OperatorNode(lambda x, y: x * y, "*", 2),left_tree,right_tree]
     
-def simplify_tree(tree: list):
-    "Simplifies a tree by transforming the tree to sympy format and reconstructing it"
+def simplify_tree(tree: list) -> list:
+    """Simplifies a tree by transforming the tree to sympy format and reconstructing it.
+
+    :param tree: Tree of operators and leaves.
+    :returns: Simplified tree.
+    """
     old_tree_string = tree_to_sympy(tree, eval=False)
     new_tree_string = tree_to_sympy(tree, eval=True)
 
+    #Check if simplification was possible
     if old_tree_string==new_tree_string:
         return False
 
-    if new_tree_string==sympy.nan or new_tree_string.has(sympy.core.numbers.ImaginaryUnit, sympy.core.numbers.ComplexInfinity): #Return None when the sympy expression contains illegal terms
+    #Check if the simplified expression contains illegal terms
+    if new_tree_string==sympy.nan or new_tree_string.has(sympy.core.numbers.ImaginaryUnit, sympy.core.numbers.ComplexInfinity):
         return False
 
+    #Reconstruct sympy expression to tree format
     new_tree = sympy_to_tree(new_tree_string, "Add" * isinstance(new_tree_string, sympy.Add) + "Mul" * isinstance(new_tree_string, sympy.Mul))
     new_tree = replace_negatives(new_tree)
     return new_tree

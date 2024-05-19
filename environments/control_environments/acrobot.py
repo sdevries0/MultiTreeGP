@@ -1,17 +1,16 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
-from environments.environment_base import EnvironmentBase
+from environments.control_environments.control_environment_base import EnvironmentBase
 
 class Acrobot(EnvironmentBase):
-    def __init__(self, sigma, obs_noise, n_obs = None):
+    def __init__(self, process_noise, obs_noise, n_obs=4):
         self.n_var = 4
         self.n_control = 1
         self.n_targets = 0
         self.n_dim = 1
         self.init_bounds = jnp.array([0.1,0.1,0.1,0.1])
-        self.default_obs = 4
-        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs if n_obs else self.default_obs)
+        super().__init__(process_noise, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
 
         self.R = jnp.array([[0.01]])
 
@@ -84,10 +83,10 @@ class Acrobot(EnvironmentBase):
         self.g = 9.81
 
         self.G = jnp.array([[0,0,0,0],[0,0,0,0],[0,0,1,0],[0,0,0,1]])
-        self.V = self.sigma*self.G
+        self.V = self.process_noise*self.G
 
         self.C = jnp.eye(self.n_var)[:self.n_obs]
-        self.W = self.obs_noise*jnp.eye(self.n_obs)*(jnp.array([1,1,1,1])[:self.n_obs])
+        self.W = self.obs_noise*jnp.eye(self.n_obs)
     
     def drift(self, t, state, args):
         control = jnp.squeeze(args)
@@ -128,16 +127,16 @@ class Acrobot(EnvironmentBase):
         return (jnp.abs(state.y[2])>(8*jnp.pi)) | (jnp.abs(state.y[3])>(18*jnp.pi)) | jnp.any(jnp.isnan(state.y)) | jnp.any(jnp.isinf(state.y))
 
 class Acrobot2(EnvironmentBase):
-    def __init__(self, sigma, obs_noise, n_obs = None):
+    def __init__(self, process_noise, obs_noise, n_obs = None):
         self.n_var = 4
         self.n_control = 2
         self.n_targets = 0
         self.n_dim = 1
         self.init_bounds = jnp.array([0.1,0.1,0.1,0.1])
         self.default_obs = 4
-        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs if n_obs else self.default_obs)
+        super().__init__(process_noise, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs if n_obs else self.default_obs)
 
-        self.R = jnp.array(0.01)*jnp.ones((self.n_control, self.n_control))
+        self.R = jnp.array(0.01)*jnp.eye(self.n_control)
 
     def sample_init_states(self, batch_size, key):
         init_key, target_key = jrandom.split(key)
@@ -208,7 +207,7 @@ class Acrobot2(EnvironmentBase):
         self.g = 9.81
 
         self.G = jnp.array([[0,0,0,0],[0,0,0,0],[0,0,1,0],[0,0,0,1]])
-        self.V = self.sigma*self.G
+        self.V = self.process_noise*self.G
 
         self.C = jnp.eye(self.n_var)[:self.n_obs]
         self.W = self.obs_noise*jnp.eye(self.n_obs)*(jnp.array([1,1,1,1])[:self.n_obs])
@@ -228,7 +227,7 @@ class Acrobot2(EnvironmentBase):
         
         theta2_acc = (c1 + d2/d1 * phi1 - self.m2 * self.l1 * self.lc2 * theta1_dot**2 * jnp.sin(theta2) - phi2) \
                     / (self.m2 * self.lc2**2 + self.moi2 - d2**2 / d1)
-        theta1_acc = (c2 - d2 * theta2_acc + phi1)/d1
+        theta1_acc = (c2 - d2 * theta2_acc - phi1)/d1
 
         return jnp.array([
             theta1_dot,

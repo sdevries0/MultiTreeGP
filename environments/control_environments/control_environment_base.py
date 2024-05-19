@@ -20,8 +20,8 @@ def force_bitcast_convert_type(val, new_type=jnp.int32):
     return jax.lax.bitcast_convert_type(val, new_type)
 
 class EnvironmentBase(abc.ABC):
-    def __init__(self, sigma, obs_noise, n_var, n_control, n_dim, n_obs):
-        self.sigma = sigma
+    def __init__(self, process_noise, obs_noise, n_var, n_control, n_dim, n_obs):
+        self.process_noise = process_noise
         self.obs_noise = obs_noise
         self.n_var = n_var
         self.n_control = n_control

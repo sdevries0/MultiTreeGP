@@ -1,10 +1,18 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
+import copy
 from jax.random import PRNGKey
 
-def migrate_trees(sender: list, receiver: list, migration_size: int, key: PRNGKey):
-    "Selects individuals that will replace randomly selected indivuals in a receiver distribution"
+def migrate_trees(sender: list, receiver: list, migration_size: int, key: PRNGKey) -> list:
+    """Selects individuals that will replace randomly selected indivuals in a receiver distribution.
+
+    :param sender: Population from which individuals are selected. 
+    :param receiver: Population in which indivuals are added.
+    :param migration_size: Number of candidates to migrate.
+    :param key: Random key.
+    :returns: New population.
+    """
     population_size = len(sender)
     sender.sort(key=lambda x: x.fitness)
     sender = sender[:migration_size]
@@ -20,15 +28,22 @@ def migrate_trees(sender: list, receiver: list, migration_size: int, key: PRNGKe
 
     return new_population
 
-def migrate_populations(populations: list, migration_method: str, migration_size: int, key: PRNGKey):
-    "Manages the migration between pairs of populations"
+def migrate_populations(populations: list, migration_method: str, migration_size: int, key: PRNGKey) -> list:
+    """Manages the migration between pairs of populations.
+
+    :param populations: Populations of tree policies. 
+    :param migration_method: Method for deciding the migration directions.
+    :param migration_size: Number of candidates to migrate.
+    :param key: Random key.
+    :returns: Mutated tree.
+    """
     assert (migration_method=="ring") or (migration_method=="random"), "This method is not implemented"
 
     num_populations = len(populations)
     if num_populations==1: #No migration possible
         return populations
 
-    populations_copy = populations
+    populations_copy = copy.copy(populations)
 
     if migration_method=="ring":
         for pop in range(num_populations):

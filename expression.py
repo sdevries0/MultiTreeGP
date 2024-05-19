@@ -36,6 +36,19 @@ class LeafNode:
             return False
         return self.string == _other.string
 
+OPERATORS = {}
+OPERATORS["+"] = OperatorNode(lambda x, y: x + y, "+", 2)
+OPERATORS["-"] = OperatorNode(lambda x, y: x - y, "-", 2)
+OPERATORS["*"] = OperatorNode(lambda x, y: x * y, "*", 2)
+OPERATORS["/"] = OperatorNode(lambda x, y: x / y, "/", 2)
+OPERATORS["power"] = OperatorNode(lambda x, y: x ** y, "**", 2)
+OPERATORS["sin"] = OperatorNode(lambda x: jnp.sin(x), "sin", 1)
+OPERATORS["cos"] = OperatorNode(lambda x: jnp.cos(x), "cos", 1)
+OPERATORS["tanh"] = OperatorNode(lambda x: jnp.tanh(x), "tanh", 1)
+OPERATORS["exp"] = OperatorNode(lambda x: jnp.exp(x), "exp", 1)
+OPERATORS["log"] = OperatorNode(lambda x: jnp.log(x), "log", 1)
+OPERATORS["squareroot"] = OperatorNode(lambda x: jnp.sqrt(x), "√", 1)
+
 class Expression:
     """
         Container class for the expression used in parse trees
@@ -47,41 +60,26 @@ class Expression:
             control_variables (list[string]): Variables that represent control signals
     """
 
-    def __init__(self, obs_size = 0, state_size = 0, control_size = 0, target_size = 0, include_unary = False, condition = None, operators_prob = None, leaf_prob = None):
-        plus = OperatorNode(lambda x, y: x + y, "+", 2)
-        minus = OperatorNode(lambda x, y: x - y, "-", 2)
-        multiplication = OperatorNode(lambda x, y: x * y, "*", 2)
-        division = OperatorNode(lambda x, y: x / y, "/", 2)
-        power = OperatorNode(lambda x, y: x ** y, "**", 2)
-        self.operators = [plus, minus, multiplication, division, power]
+    def __init__(self, variables, operator_types = None, operator_probs = None, condition = None):
+        if operator_types == None:
+            operator_types = ["+", "-", "*", "/", "power"]
 
-        if include_unary:
-            sine = OperatorNode(lambda x: jnp.sin(x), "sin", 1)
-            cosine = OperatorNode(lambda x: jnp.cos(x), "cos", 1)
-            tanh = OperatorNode(lambda x: jnp.tanh(x), "tanh", 1)
-            exp = OperatorNode(lambda x: jnp.exp(x), "exp", 1)
-            squareroot = OperatorNode(lambda x: jnp.sqrt(x), "√", 1)
-            self.operators.extend([sine, cosine])
+        operators = []
+        for op_string in operator_types:
+            operators.append(OPERATORS[op_string])
+        self.operators = operators
 
-        if operators_prob is None:
+        if operator_probs is None:
             self.operators_prob = jnp.ones(len(self.operators))
         else:
-            assert len(operators_prob) == len(self.operators), "Length of probabilities does not match the number of operators"
-            self.operators_prob = operators_prob
-            
+            assert len(operator_probs) == len(self.operators), "Length of probabilities does not match the number of operators"
+            self.operators_prob = operator_probs
 
         self.leaf_nodes = []
-        if obs_size > 0:
-            self.leaf_nodes.extend([LeafNode("y", i) for i in range(obs_size)])
-        if state_size > 0:
-            self.state_variables = [LeafNode("a", i) for i in range(state_size)]
-            self.leaf_nodes.extend(self.state_variables)
-        if control_size > 0:
-            self.leaf_nodes.extend([LeafNode("u", i) for i in range(control_size)])
-        if target_size > 0:
-            self.leaf_nodes.extend([LeafNode("tar", i) for i in range(target_size)])
+        for var_string, var_size in variables:
+            self.leaf_nodes.extend([LeafNode(var_string, i) for i in range(var_size)])
 
         if condition:
-            self.condition = lambda tree: condition(self, tree)
+            self.condition = lambda tree: condition(tree)
         else:
-            self.condition = lambda _: False
+            self.condition = lambda _: True

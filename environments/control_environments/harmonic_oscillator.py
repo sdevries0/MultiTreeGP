@@ -2,18 +2,17 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 import diffrax
-from environments.environment_base import EnvironmentBase
+from environments.control_environments.control_environment_base import EnvironmentBase
 
 class HarmonicOscillator(EnvironmentBase):
-    def __init__(self, sigma, obs_noise, n_obs = None):
+    def __init__(self, process_noise, obs_noise, n_obs = 2):
         self.n_dim = 1
         self.n_var = 2
         self.n_control = 1
         self.n_targets = 1
         self.mu0 = jnp.zeros(self.n_var)
         self.P0 = jnp.eye(self.n_var)*jnp.array([3.0, 1.0])
-        self.default_obs = 2
-        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs if n_obs else self.default_obs)
+        super().__init__(process_noise, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
 
         self.q = self.r = 0.5
         self.Q = jnp.array([[self.q,0],[0,0]])
@@ -68,7 +67,7 @@ class HarmonicOscillator(EnvironmentBase):
 
         self.b = jnp.array([[0.0,1.0]]).T
         self.G = jnp.array([[0,0],[0,1]])
-        self.V = self.sigma*self.G
+        self.V = self.process_noise*self.G
 
         self.C = jnp.eye(self.n_var)[:self.n_obs]
         self.W = self.obs_noise*jnp.eye(self.n_obs)
@@ -92,15 +91,14 @@ class HarmonicOscillator(EnvironmentBase):
         return jnp.any(jnp.isnan(state.y))# | jnp.any(jnp.isinf(state.y))
     
 class ChangingHarmonicOscillator(EnvironmentBase):
-    def __init__(self, sigma, obs_noise, n_obs = None):
+    def __init__(self, process_noise, obs_noise, n_obs = 2):
         self.n_dim = 1
         self.n_var = 2
         self.n_control = 1
         self.n_targets = 1
         self.mu0 = jnp.zeros(self.n_var)
         self.P0 = jnp.eye(self.n_var)*jnp.array([3.0, 1.0])
-        self.default_obs = 2
-        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs if n_obs else self.default_obs)
+        super().__init__(process_noise, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs)
 
         self.q = self.r = 0.5
         self.Q = jnp.array([[self.q,0],[0,0]])
@@ -155,7 +153,7 @@ class ChangingHarmonicOscillator(EnvironmentBase):
 
         self.b = jnp.array([[0.0,1.0]]).T
         self.G = jnp.array([[0,0],[0,1]])
-        self.V = self.sigma*self.G
+        self.V = self.process_noise*self.G
 
         self.C = jnp.eye(self.n_var)[:self.n_obs]
         self.W = self.obs_noise*jnp.eye(self.n_obs)
@@ -178,7 +176,7 @@ class ChangingHarmonicOscillator(EnvironmentBase):
         return jnp.any(jnp.isnan(state.y))# | jnp.any(jnp.isinf(state.y))
 
 class HarmonicOscillator2(EnvironmentBase):
-    def __init__(self, sigma, obs_noise, n_obs=None):
+    def __init__(self, process_noise, obs_noise, n_obs=None):
         self.n_dim = 2
         self.n_var = 2
         self.n_control = self.n_dim
@@ -186,7 +184,7 @@ class HarmonicOscillator2(EnvironmentBase):
         self.mu0 = jnp.zeros(self.n_var*self.n_dim)
         self.P0 = jnp.eye(self.n_var*self.n_dim)*jnp.array([3.0, 1.0, 3.0, 1.0])
         self.default_obs = 4
-        super().__init__(sigma, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs if n_obs else self.default_obs)
+        super().__init__(process_noise, obs_noise, self.n_var, self.n_control, self.n_dim, n_obs if n_obs else self.default_obs)
 
         self.q = self.r = 0.5
         self.Q = self.block_diagonal(jnp.array([[self.q,0],[0,0]]))
@@ -218,7 +216,7 @@ class HarmonicOscillator2(EnvironmentBase):
 
         self.b = self.block_diagonal(jnp.array([[0.0,1.0]]).T)
         self.G = self.block_diagonal(jnp.array([[0,0],[0,1]]))
-        self.V = self.sigma*self.G
+        self.V = self.process_noise*self.G
 
         indices = jnp.array([jnp.arange(i*self.n_var, (i+1)*self.n_var)[:self.n_obs] for i in range(self.n_dim)])
         self.C = jnp.eye(self.n_var*self.n_dim)[jnp.ravel(indices)]
