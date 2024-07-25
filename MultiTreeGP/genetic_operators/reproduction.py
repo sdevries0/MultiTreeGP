@@ -198,7 +198,6 @@ def next_population(population: list,
             new_pop.append(new_trees)
 
         elif reproduction_type==3: #Simplification of a tree policy
-            print("simpli")
             child = parent
             simplified = False
             for i in range(layer_sizes.shape[0]):
