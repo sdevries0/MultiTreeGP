@@ -18,30 +18,30 @@ class Evaluator:
         self.dt0 = dt0
         self.fitness_function = lambda pred_ys, true_ys: jnp.mean(jnp.sum(jnp.square(pred_ys-true_ys), axis=-1)) #Mean Squared Error
 
-    def __call__(self, model: Tuple, data: Tuple) -> float:
+    def __call__(self, model: jnp.ndarray, jit_eval, data: Tuple) -> float:
         """Evaluates the model on an environment.
 
         :param model: Callable model of symbolic expressions.
         :param data: The data required to evaluate the model.
         :returns: Fitness of the model.
         """
-        _, fitness = self.evaluate_model(model, data)
+        _, fitness = self.evaluate_model(model, jit_eval, data)
 
         nan_or_inf =  jax.vmap(lambda f: jnp.isinf(f) + jnp.isnan(f))(fitness)
         fitness = jnp.where(nan_or_inf, jnp.ones(fitness.shape)*self.max_fitness, fitness)
         fitness = jnp.mean(fitness)
         return jnp.clip(fitness,0,self.max_fitness)
     
-    def evaluate_model(self, model: Tuple, data: Tuple) -> Tuple[Array, float]:
+    def evaluate_model(self, model: jnp.ndarray, jit_eval, data: Tuple) -> Tuple[Array, float]:
         """Evaluate a tree by solving the model as a differential equation.
 
         :param model: Callable model of symbolic expressions.
         :param data: The data required to evaluate the model.
         :returns: Predictions and fitness of the model.
         """
-        return jax.vmap(self.evaluate_time_series, in_axes=[None, 0, None, 0])(model, *data)
+        return jax.vmap(self.evaluate_time_series, in_axes=[None, None, 0, None, 0])(model, jit_eval, *data)
     
-    def evaluate_time_series(self, model: Tuple, x0: Array, ts: Array, ys: Array) -> Tuple[Array, float]:
+    def evaluate_time_series(self, model: jnp.ndarray, jit_eval, x0: Array, ts: Array, ys: Array) -> Tuple[Array, float]:
         """Solves the model to get predictions. The predictions are used to compute the fitness of the model.
 
         :param model: Callable model of symbolic expressions. 
@@ -51,11 +51,11 @@ class Evaluator:
         :returns: Predictions and fitness of the model.
         """
 
-        model = model[0]
+        # model = model[0]
 
         #Define state equation
         def _drift(t, x, args):
-            dx = model(data=x)
+            dx = jit_eval(model, x)
             return dx
         
         solver = diffrax.Euler()
@@ -63,11 +63,11 @@ class Evaluator:
         saveat = diffrax.SaveAt(ts=ts)
 
         system = diffrax.ODETerm(_drift)
-        start = time.time()
+        # start = time.time()
         sol = diffrax.diffeqsolve(
             system, solver, ts[0], ts[-1], dt0, x0, saveat=saveat, max_steps=16**4
         )
-        print("end", time.time() - start)
+        # print("end", time.time() - start)
 
         fitness = self.fitness_function(sol.ys, ys)
 

@@ -145,6 +145,13 @@ class GeneticProgramming(Strategy):
             "x1": -8
         }
 
+        # self.func_dict = {
+        #     "+": -1,
+        #     "*": -2,
+        #     "x0": -3,
+        #     "x1": -4
+        # }
+
         self.functions = [
             lambda x, y, _data: 0.0,
             lambda x, y, _data: x+y,
@@ -156,6 +163,13 @@ class GeneticProgramming(Strategy):
             lambda x, y, _data: _data[0],
             lambda x, y, _data: _data[1]]
 
+        # self.functions = [
+        #     lambda x, y, _data: 0.0,
+        #     lambda x, y, _data: x+y,
+        #     lambda x, y, _data: x*y,
+        #     lambda x, y, _data: _data[0],
+        #     lambda x, y, _data: _data[1]]
+        
     def initialize_population(self, key: PRNGKey) -> list:
         """Randomly initializes the population.
 
@@ -218,22 +232,17 @@ class GeneticProgramming(Strategy):
 
         return (array, data)
 
-    def foriloop(self, array, data, max_depth):
-        x, _ = jax.lax.fori_loop(0, max_depth, self.body_fun, (array, data))
-        return x
+    def foriloop(self, data, array):
+        x, _ = jax.lax.fori_loop(0, self.nr_nodes, self.body_fun, (array, data))
+        return data, x.at[-1, -1].get()
     
-    def vmap_foriloop(self, array, data, max_depth):
-        result = jax.vmap(jax.jit(self.foriloop), in_axes=[0, None, None])(array, data, max_depth)
-        return result[:, -1, -1]
-    
-    def evaluate(self, candidate, data, max_depth, layer_sizes):
-        partial_funcs = []
-        split_candidate = jnp.split(candidate, jnp.cumsum(layer_sizes))[:-1]
-        for i in range(layer_sizes.shape[0]):
-            partial_funcs.append(jax.jit(partial(self.vmap_foriloop, array = split_candidate[i], max_depth=max_depth)))
+    # def vmap_foriloop(self, array, data):
+    #     result = jax.vmap(self.foriloop, in_axes=[0, None])(array, data)
+    #     return result.at[:, -1, -1].get()
 
-        fitness = self.fitness_function(partial_funcs, data)
-        return fitness
+    def vmap_foriloop(self, array, data):
+        _, result = jax.lax.scan(self.foriloop, init=data, xs=array)
+        return jnp.array(result)
 
     def evaluate_population(self, populations: list, data: Tuple) -> Tuple[Array, list]:
         """Evaluates every candidate in population and assigns a fitness.
@@ -243,23 +252,29 @@ class GeneticProgramming(Strategy):
 
         Returns: Fitness and evaluated population.
         """
-
+      
         population_matrix = jnp.zeros((self.num_populations*self.population_size, jnp.sum(self.layer_sizes), self.nr_nodes, 4))
 
+        start = time.time()
         for pop, population in enumerate(populations):
             for i in range(self.population_size):
                 population_matrix = population_matrix.at[i + pop*self.population_size].set(self.tree_to_matrix(population[i]))
+        print("map", time.time()-start)
 
-        fitness = jax.vmap(self.evaluate, in_axes=[0, None, None, None])(population_matrix, data, self.nr_nodes, self.layer_sizes)
+        start = time.time()
 
-        fitness = fitness.reshape((self.num_populations, self.population_size))
+        fitness = jax.vmap(self.fitness_function, in_axes=[0, None, None])(population_matrix, jax.jit(self.vmap_foriloop), data)
+
+        print("eval", time.time() - start)
+
+        fitnesses = fitness.reshape((self.num_populations, self.population_size))
 
         for pop, population in enumerate(populations):
             for i in range(self.population_size):
-                population[i].set_fitness(fitness[pop, i] + self.size_parsinomy*len(jax.tree_util.tree_leaves(population[i]())))
+                population[i].set_fitness(fitnesses[pop, i] + self.size_parsinomy*len(jax.tree_util.tree_leaves(population[i]())))
 
-        self.best_fitness_per_population = self.best_fitness_per_population.at[self.current_generation].set(jnp.min(fitness, axis=1))
-        best_solution_of_g = find_best_solution(populations, fitness)
+        self.best_fitness_per_population = self.best_fitness_per_population.at[self.current_generation].set(jnp.min(fitnesses, axis=1))
+        best_solution_of_g = find_best_solution(populations, fitnesses)
         best_fitness_of_g = best_solution_of_g.fitness
 
         #Keep track of best solution
