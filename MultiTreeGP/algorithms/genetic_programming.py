@@ -120,8 +120,8 @@ class GeneticProgramming(Strategy):
         self.selection_pressures = jnp.linspace(0.6,0.9,self.num_populations)
         self.tournament_probabilities = jnp.array([sp*(1-sp)**jnp.arange(self.tournament_size) for sp in self.selection_pressures])
         
-        self.reproduction_type_probabilities = jnp.vstack([jnp.linspace(0.85,0.45,self.num_populations),jnp.linspace(0.1,0.5,self.num_populations),
-                                         jnp.linspace(0.0,0.0,self.num_populations),jnp.linspace(0.05,0.05,self.num_populations)]).T
+        self.reproduction_type_probabilities = jnp.vstack([jnp.linspace(0.90,0.5,self.num_populations),jnp.linspace(0.1,0.5,self.num_populations),
+                                         jnp.linspace(0.0,0.0,self.num_populations),jnp.linspace(0.0,0.0,self.num_populations)]).T
         self.reproduction_probabilities = jnp.linspace(1.0, 1.0, self.num_populations)
         self.elite_percentage = jnp.linspace(0.04, 0.04)
 
