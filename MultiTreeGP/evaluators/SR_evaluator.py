@@ -3,6 +3,7 @@ from jax import Array
 import jax.numpy as jnp
 from typing import Tuple
 import diffrax
+import time
 
 class Evaluator:
     """Evaluator for symbolic expressions on symbolic regression tasks.
@@ -54,7 +55,7 @@ class Evaluator:
 
         #Define state equation
         def _drift(t, x, args):
-            dx = model({"x":x})
+            dx = model(data=x)
             return dx
         
         solver = diffrax.Euler()
@@ -62,9 +63,11 @@ class Evaluator:
         saveat = diffrax.SaveAt(ts=ts)
 
         system = diffrax.ODETerm(_drift)
+        start = time.time()
         sol = diffrax.diffeqsolve(
             system, solver, ts[0], ts[-1], dt0, x0, saveat=saveat, max_steps=16**4
         )
+        print("end", time.time() - start)
 
         fitness = self.fitness_function(sol.ys, ys)
 
