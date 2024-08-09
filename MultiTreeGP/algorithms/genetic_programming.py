@@ -1,6 +1,7 @@
 import warnings
 
 import jax
+print(jax.devices())
 from jax import Array
 
 import jax.numpy as jnp
@@ -9,6 +10,9 @@ from jax.random import PRNGKey
 import optax
 import equinox as eqx
 from functools import partial
+from jax.experimental.shard_map import shard_map
+from jax.sharding import Mesh, PartitionSpec as P
+from jax.experimental import mesh_utils
 
 from typing import Tuple, Callable
 import copy
@@ -36,6 +40,15 @@ def find_best_solution(populations: list, fitnesses: Array) -> TreePolicy:
             best_fitness = jnp.min(fitnesses[pop])
             best_solution = populations[pop][jnp.argmin(fitnesses[pop])]
     return best_solution
+
+def lambda_func1(f):
+    return lambda x, y, _data: f(x)
+
+def lambda_func2(f):
+    return lambda x, y, _data: f(x, y)
+
+def lambda_leaf(i):
+    return lambda x, y, _data: _data[i]
 
 class GeneticProgramming(Strategy):
     """Genetic programming strategy of symbolic expressions.
@@ -77,6 +90,7 @@ class GeneticProgramming(Strategy):
                  num_populations: int = 1, 
                  max_depth: int = 7, 
                  max_init_depth: int = 4, 
+                 max_nodes: int = 40,
                  tournament_size: int = 7, 
                  init_method: str = "ramped", 
                  size_parsinomy: float = 1.0, 
@@ -94,8 +108,11 @@ class GeneticProgramming(Strategy):
         self.num_populations = num_populations
         self.max_depth = max_depth
         self.max_init_depth = max_init_depth
-        self.nr_nodes = 2**self.max_depth-1
+        self.max_nodes = min(max_nodes, 2**self.max_depth-1)
         self.init_method = init_method
+        if (init_method=="ramped") or (init_method=="full"):
+            assert 2**self.max_init_depth < self.max_nodes, "Full trees are not possible given initialization depth and max size"
+
         self.size_parsinomy = size_parsinomy
         self.leaf_sd = leaf_sd
 
@@ -117,9 +134,9 @@ class GeneticProgramming(Strategy):
         self.selection_pressures = jnp.linspace(0.6,0.9,self.num_populations)
         self.tournament_probabilities = jnp.array([sp*(1-sp)**jnp.arange(self.tournament_size) for sp in self.selection_pressures])
         
-        self.reproduction_type_probabilities = jnp.vstack([jnp.linspace(0.85,0.45,self.num_populations),jnp.linspace(0.1,0.5,self.num_populations),
-                                         jnp.linspace(0.0,0.0,self.num_populations),jnp.linspace(0.05,0.05,self.num_populations)]).T
-        self.reproduction_probabilities = jnp.linspace(1.0, 1.0, self.num_populations)
+        self.reproduction_type_probabilities = jnp.vstack([jnp.linspace(0.9,0.5,self.num_populations),jnp.linspace(0.1,0.5,self.num_populations),
+                                         jnp.linspace(0.0,0.0,self.num_populations),jnp.linspace(0.0,0.0,self.num_populations)]).T
+        self.reproduction_probabilities = jnp.linspace(1.0, 0.5, self.num_populations)
         self.elite_percentage = jnp.linspace(0.04, 0.04)
 
         self.mutation_probabilities = {}
@@ -134,41 +151,34 @@ class GeneticProgramming(Strategy):
 
         self.best_fitness_per_population = jnp.zeros((num_generations, self.num_populations))
 
-        self.func_dict = {
-            "+": -1,
-            "-": -2,
-            "*": -3,
-            "/": -4,
-            "**": -5,
-            "**2": -6,
-            "x0": -7,
-            "x1": -8
-        }
+        func_dict = {}
+        functions = [lambda x, y, _data: 0.0]
 
-        # self.func_dict = {
-        #     "+": -1,
-        #     "*": -2,
-        #     "x0": -3,
-        #     "x1": -4
-        # }
+        index = -1
+        data_index = 0
 
-        self.functions = [
-            lambda x, y, _data: 0.0,
-            lambda x, y, _data: x+y,
-            lambda x, y, _data: x-y,
-            lambda x, y, _data: x*y,
-            lambda x, y, _data: x/y,
-            lambda x, y, _data: x**y,
-            lambda x, y, _data: x**2,
-            lambda x, y, _data: _data[0],
-            lambda x, y, _data: _data[1]]
+        for expression in self.expressions:
+            for operator in expression.operators:
+                if operator.string not in func_dict:
+                    func_dict[operator.string] = index
+                    if operator.arity==1:
+                        functions.append(lambda_func1(operator.f))
+                    elif operator.arity==2:
+                        functions.append(lambda_func2(operator.f))
+                    index -= 1
 
-        # self.functions = [
-        #     lambda x, y, _data: 0.0,
-        #     lambda x, y, _data: x+y,
-        #     lambda x, y, _data: x*y,
-        #     lambda x, y, _data: _data[0],
-        #     lambda x, y, _data: _data[1]]
+            for leaf in expression.leaf_nodes:
+                if leaf.string not in func_dict:
+                    func_dict[leaf.string] = index
+                    functions.append(lambda_leaf(data_index))
+                    index -= 1
+                    data_index += 1
+
+        self.func_dict = func_dict
+        self.functions = functions
+        
+        self.vmap_trees = jax.jit(jax.vmap(partial(self.fitness_function, eval = self.vmap_foriloop), in_axes=[0, None]))
+        self.jit_body_fun = jax.jit(partial(self.body_fun, functions = self.functions))
         
     def initialize_population(self, key: PRNGKey) -> list:
         """Randomly initializes the population.
@@ -186,6 +196,7 @@ class GeneticProgramming(Strategy):
         return populations
     
     def map_node(self, tree, matrix, index):
+        _index = index
         if isinstance(tree[0], jax.numpy.ndarray):
             matrix = matrix.at[index, 0].set(jnp.abs(tree[0]))
             if tree[0]>0:
@@ -196,17 +207,17 @@ class GeneticProgramming(Strategy):
             matrix = matrix.at[index, 0].set(self.func_dict[str(tree[0])])
 
             if len(tree)==3:
-                matrix = self.map_node(tree[1], matrix, -self.nr_nodes + 2*index)
-                matrix = self.map_node(tree[2], matrix, -self.nr_nodes + 2*index - 1)
-                matrix = matrix.at[index, 1].set(-self.nr_nodes + 2*index)
-                matrix = matrix.at[index, 2].set(-self.nr_nodes + 2*index - 1)
+                matrix = matrix.at[index, 1].set(index-1)
+                matrix, _index = self.map_node(tree[1], matrix, index-1)
+                matrix = matrix.at[index, 2].set(_index-1)
+                matrix, _index = self.map_node(tree[2], matrix, _index-1)
             if len(tree)==2:
-                matrix = self.map_node(tree[1], matrix, -self.nr_nodes + 2*index)
-                matrix = matrix.at[index, 1].set(-self.nr_nodes + 2*index)
-        return matrix
+                matrix = matrix.at[index, 1].set(index-1)
+                matrix, _index = self.map_node(tree[1], matrix, index-1)
+        return matrix, _index
 
     def tree_to_matrix(self, candidate):
-        matrix = jnp.zeros((jnp.sum(self.layer_sizes), self.nr_nodes, 4))
+        matrix = jnp.zeros((jnp.sum(self.layer_sizes), self.max_nodes, 4))
 
         trees = candidate()
 
@@ -216,34 +227,33 @@ class GeneticProgramming(Strategy):
                     index = jnp.sum(self.layer_sizes[:i]) + j
                 else:
                     index = j
-                matrix = matrix.at[index].set(self.map_node(trees[i][j], matrix[index], self.nr_nodes - 1))
+                submatrix, _ = self.map_node(trees[i][j], matrix[index], self.max_nodes - 1)
+                matrix = matrix.at[index].set(submatrix)
 
         return matrix
-    
-    def body_fun(self, i, carry):
+
+    def body_fun(self, i, carry, functions):
         array, data = carry
-        f_idx, a_idx, b_idx, _ = array.at[i].get()
-        
-        x = array.at[a_idx.astype(int), 3].get()
-        y = array.at[b_idx.astype(int), 3].get()
-        value = jax.lax.select(f_idx < 0, jax.lax.switch(-f_idx.astype(int), self.functions, x, y, data), f_idx * a_idx)
+        f_idx, a_idx, b_idx, _ = array[i]
+    
+        x = array[a_idx.astype(int), 3]
+        y = array[b_idx.astype(int), 3]
+        value = jax.lax.select(f_idx < 0, jax.lax.switch(-f_idx.astype(int), functions, x, y, data), f_idx * a_idx)
         
         array = array.at[i, 3].set(value)
 
         return (array, data)
 
-    def foriloop(self, data, array):
-        x, _ = jax.lax.fori_loop(0, self.nr_nodes, self.body_fun, (array, data))
-        return data, x.at[-1, -1].get()
-    
-    # def vmap_foriloop(self, array, data):
-    #     result = jax.vmap(self.foriloop, in_axes=[0, None])(array, data)
-    #     return result.at[:, -1, -1].get()
+    def foriloop(self, carry, array):
+        data, max_size = carry
+        x, _ = jax.lax.fori_loop(0, max_size, self.jit_body_fun, (array, data))
+        return (data, max_size), x[-1, -1]
 
     def vmap_foriloop(self, array, data):
-        _, result = jax.lax.scan(self.foriloop, init=data, xs=array)
+        _, result = jax.lax.scan(self.foriloop, init=(data, self.max_nodes), xs=array)
+        # result = jax.vmap(self.foriloop, in_axes=[0, None, None])(array, data, self.max_nodes)
         return jnp.array(result)
-
+    
     def evaluate_population(self, populations: list, data: Tuple) -> Tuple[Array, list]:
         """Evaluates every candidate in population and assigns a fitness.
 
@@ -253,28 +263,36 @@ class GeneticProgramming(Strategy):
         Returns: Fitness and evaluated population.
         """
       
-        population_matrix = jnp.zeros((self.num_populations*self.population_size, jnp.sum(self.layer_sizes), self.nr_nodes, 4))
+        population_matrix = jnp.zeros((self.num_populations*self.population_size, jnp.sum(self.layer_sizes), self.max_nodes, 4))
 
-        start = time.time()
+        # start = time.time()
         for pop, population in enumerate(populations):
             for i in range(self.population_size):
+                # population_matrix = population_matrix.at[pop, i].set(self.tree_to_matrix(population[i]))
                 population_matrix = population_matrix.at[i + pop*self.population_size].set(self.tree_to_matrix(population[i]))
-        print("map", time.time()-start)
 
-        start = time.time()
+        # print("map", time.time()-start)
 
-        fitness = jax.vmap(self.fitness_function, in_axes=[0, None, None])(population_matrix, jax.jit(self.vmap_foriloop), data)
+        # start = time.time()
 
-        print("eval", time.time() - start)
+        devices = mesh_utils.create_device_mesh((len(jax.devices('cpu'))))
+        mesh = Mesh(devices, axis_names=('i'))
+        
+        @partial(shard_map, mesh=mesh, in_specs=(P('i'), P(None)), out_specs=P('i'), check_rep=False)
+        def shard_fn(array, data):
+            result = self.vmap_trees(array, data)
+            return result
+        
+        fitness = shard_fn(population_matrix, data)
 
-        fitnesses = fitness.reshape((self.num_populations, self.population_size))
+        fitness = fitness.reshape((self.num_populations, self.population_size))
 
         for pop, population in enumerate(populations):
             for i in range(self.population_size):
-                population[i].set_fitness(fitnesses[pop, i] + self.size_parsinomy*len(jax.tree_util.tree_leaves(population[i]())))
+                population[i].set_fitness(fitness[pop, i] + self.size_parsinomy*len(jax.tree_util.tree_leaves(population[i]())))
 
-        self.best_fitness_per_population = self.best_fitness_per_population.at[self.current_generation].set(jnp.min(fitnesses, axis=1))
-        best_solution_of_g = find_best_solution(populations, fitnesses)
+        self.best_fitness_per_population = self.best_fitness_per_population.at[self.current_generation].set(jnp.min(fitness, axis=1))
+        best_solution_of_g = find_best_solution(populations, fitness)
         best_fitness_of_g = best_solution_of_g.fitness
 
         #Keep track of best solution
@@ -291,6 +309,8 @@ class GeneticProgramming(Strategy):
             
         self.best_solutions.append(best_solution)
         self.best_fitnesses = self.best_fitnesses.at[self.current_generation].set(best_fitness)
+
+        # print("eval", time.time() - start)
 
         return fitness, populations
     
@@ -423,4 +443,4 @@ class GeneticProgramming(Strategy):
             return initialization.sample_trees(key, self.expressions, self.layer_sizes, self.population_size, self.max_init_depth, self.init_method, self.leaf_sd)
         else:
             return reproduction.next_population(population, key, self.expressions, self.layer_sizes, self.reproduction_type_probabilities[index], self.reproduction_probabilities[index], 
-                                        self.mutation_probabilities, self.tournament_probabilities[index], self.tournament_size, self.max_depth, self.max_init_depth, self.elite_percentage[index], self.leaf_sd)
+                                        self.mutation_probabilities, self.tournament_probabilities[index], self.tournament_size, self.max_depth, self.max_init_depth, self.max_nodes, self.elite_percentage[index], self.leaf_sd)

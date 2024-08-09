@@ -76,7 +76,7 @@ def full_node(key: PRNGKey, expressions: Expression, depth: int, leaf_sd):
         tree.append(grow_node(new_key2, expressions, depth-1, leaf_sd))
     return tree
 
-def sample_trees(key: PRNGKey, expressions: list, layer_sizes: Array, N: int = 1, max_depth: int = 5, init_method: str = "ramped", leaf_sd: float = 1) -> list:
+def sample_trees(key: PRNGKey, expressions: list, layer_sizes: Array, N: int = 1, max_depth: int = 4, init_method: str = "ramped", leaf_sd: float = 1) -> list:
     """Samples tree policies until the population size has been reached.
 
     :param key: Random key. 
@@ -89,6 +89,7 @@ def sample_trees(key: PRNGKey, expressions: list, layer_sizes: Array, N: int = 1
     :returns: Leaf node.
     """
     assert (init_method=="ramped") or (init_method=="full") or (init_method=="grow"), "This method is not implemented"
+    
     population = []
     while len(population) < N:
         individual = []
@@ -96,7 +97,7 @@ def sample_trees(key: PRNGKey, expressions: list, layer_sizes: Array, N: int = 1
             layer = []
             while len(layer) < layer_sizes[i]:
                 key, new_key1, new_key2, new_key3 = jrandom.split(key, 4)
-                depth = jrandom.randint(new_key1, (), 2, max_depth+1) #Sample depth of tree between 2 and specified max depth
+                depth = jrandom.randint(new_key1, (), 3, max_depth+1) #Sample depth of tree between 2 and specified max depth
                 if init_method=="grow":
                     tree = grow_node(new_key2, expressions[i], depth, leaf_sd)
                     if expressions[i].condition(tree):

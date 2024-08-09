@@ -22,7 +22,6 @@ class OperatorNode:
 
 class LeafNode:
     def __init__(self, var, index):
-        self.f = lambda args: args[var][index]
         self.string = var + str(index)
         self.arity = 0
 

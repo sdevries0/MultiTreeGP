@@ -12,14 +12,20 @@ import MultiTreeGP.genetic_operators.simplification as simplification
 from MultiTreeGP.networks.tree_policy import TreePolicy
 
 
-def tree_depth(tree: TreePolicy) -> int:
+def tree_depth_and_size(offspring: TreePolicy) -> int:
     """Returns highest depth of tree.
 
     :param tree: Tree policy.
     :returns: Highest depth of the nodes in the tree.
     """
-    flat_tree = jax.tree_util.tree_leaves_with_path(tree)
-    return jnp.max(jnp.array([len(node[0]) for node in flat_tree]))
+    max_depth = max_size = 0
+    for layer in offspring():
+        for tree in layer:
+            flat_tree = jax.tree_util.tree_leaves_with_path(tree)
+            max_depth = max(max_depth, jnp.max(jnp.array([len(node[0]) for node in flat_tree])))
+            max_size = max(max_size, len(flat_tree))
+
+    return max_depth, max_size
 
 def tournament_selection(population: list, key: PRNGKey, tournament_probabilities: Array, tournament_size: int) -> TreePolicy:
     """Selects a candidate from a randomly selected tournament. Selection is based on fitness and the probability of being chosen given a rank.
@@ -43,7 +49,7 @@ def tournament_selection(population: list, key: PRNGKey, tournament_probabilitie
     index = jrandom.choice(key2, tournament_size, p=tournament_probabilities)
     return tournament[index]
 
-def invalid_trees(parent: TreePolicy, child: TreePolicy, layer_sizes: Array, expressions: list) -> bool:
+def invalid_trees(parent: TreePolicy, child: TreePolicy, layer_sizes: Array, expressions: list, max_depth: int, max_nodes: int) -> bool:
     """If the child is equal to its parent or violates a condition, do not accept it in the new population.
 
     :param parent: Parent tree policy.
@@ -52,8 +58,10 @@ def invalid_trees(parent: TreePolicy, child: TreePolicy, layer_sizes: Array, exp
     :param expressions: Expressions for each layer in a tree policy.
     :returns: Boolean indicating whether the child should be accepted in the new population.
     """
-    # if parent == child:
-    #     return True
+    depth, size = tree_depth_and_size(child)
+    if depth > max_depth or size > max_nodes:
+        return True
+
     equals = True
 
     for i in range(len(layer_sizes)):
@@ -75,6 +83,7 @@ def next_population(population: list,
                     tournament_size: int, 
                     max_depth: int, 
                     max_init_depth: int, 
+                    max_nodes: int,
                     elite_percentage: float,
                     leaf_sd: float
                 ) -> list:
@@ -132,7 +141,7 @@ def next_population(population: list,
                 offspring = crossover.standard_cross_over(parent, partner, reproduction_probability, layer_sizes, new_key3, expressions)
 
             #If a tree policy remain the same or one of the trees exceeds the max depth, cross-over has failed
-            if tree_depth(offspring[0]) > max_depth or invalid_trees(parent, offspring[0], layer_sizes, expressions):
+            if invalid_trees(parent, offspring[0], layer_sizes, expressions, max_depth, max_nodes):
                 failed_mutations += 1
             else:
                 #Append new tree policy to the new population
@@ -151,7 +160,7 @@ def next_population(population: list,
                 # print(f"Crossover type {cross_over_type}, parent: {parent}, child: {offspring[0]}")
 
             #If a tree policy remain the same or one of the trees exceeds the max depth, cross-over has failed
-            if tree_depth(offspring[1]) > max_depth or invalid_trees(partner, offspring[1], layer_sizes, expressions):
+            if invalid_trees(partner, offspring[1], layer_sizes, expressions, max_depth, max_nodes):
                 failed_mutations += 1
             else:
                 #Append new tree policy to the new population
@@ -174,7 +183,7 @@ def next_population(population: list,
                                     expressions, max_init_depth, leaf_sd)
             
             #If a tree policy remain the same or one of the trees exceeds the max depth, mutation has failed
-            if (tree_depth(child) > max_depth) or invalid_trees(parent, child, layer_sizes, expressions):
+            if invalid_trees(parent, child, layer_sizes, expressions, max_depth, max_nodes):
                 failed_mutations += 1
             else:
                 #Append new tree policy to the new population
@@ -191,7 +200,7 @@ def next_population(population: list,
 
         elif reproduction_type==2: #Sample new tree policy
             key, new_key = jrandom.split(key)
-            new_trees = initialization.sample_trees(new_key, expressions, layer_sizes, max_depth = max_init_depth, N = 1, 
+            new_trees = initialization.sample_trees(new_key, expressions, layer_sizes, max_depth = max_init_depth, max_size = max_nodes, N = 1, 
                                                     init_method = "ramped", leaf_sd = leaf_sd)
             #Add new tree policy to the new population
             remaining_candidates -= 1

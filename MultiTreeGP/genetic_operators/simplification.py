@@ -10,8 +10,8 @@ def tree_to_string(tree: list) -> str:
     :returns: String representation of tree.
     """
     if len(tree)==3:
-        left_tree = "(" + tree_to_string(tree[1]) + ")" if len(tree[1]) == 3 else tree_to_string(tree[1])
-        right_tree = "(" + tree_to_string(tree[2]) + ")" if len(tree[2]) == 3 else tree_to_string(tree[2])
+        left_tree = "(" + tree_to_string(tree[1]) + ")" if len(tree[1]) > 1 else tree_to_string(tree[1])
+        right_tree = "(" + tree_to_string(tree[2]) + ")" if len(tree[2]) > 1 else tree_to_string(tree[2])
         return left_tree + str(tree[0]) + right_tree
     elif len(tree)==2:
         if tree[0].in_front:
