@@ -22,7 +22,7 @@ class Evaluator:
         self.latent_size = env.n_var
         self.dt0 = dt0
 
-    def __call__(self, model, data) -> float:
+    def __call__(self, model, data, eval) -> float:
         """Computes the fitness of a model.
 
         :param model: Model with trees for the hidden state and readout.
@@ -30,14 +30,14 @@ class Evaluator:
 
         Returns: The fitness of the model.
         """
-        _, _, _, fitness = self.evaluate_model(model, data)
+        _, _, _, fitness = self.evaluate_model(model, data, eval)
 
         nan_or_inf =  jax.vmap(lambda f: jnp.isinf(f) + jnp.isnan(f))(fitness)
         fitness = jnp.where(nan_or_inf, jnp.ones(fitness.shape)*self.max_fitness, fitness)
         fitness = jnp.mean(fitness)
         return jnp.clip(fitness,0,self.max_fitness)
     
-    def evaluate_model(self, model: Tuple, data: Tuple) -> Tuple[Array, Array, Array, float]:
+    def evaluate_model(self, model: Tuple, data: Tuple, eval) -> Tuple[Array, Array, Array, float]:
         """Evaluate a tree by simulating the environment and controller as a coupled system.
 
         :param model: Model with trees for the hidden state and readout.
@@ -45,9 +45,9 @@ class Evaluator:
 
         Returns: States, observations, control and the fitness of the model.
         """
-        return jax.vmap(self.evaluate_control_loop, in_axes=[None, 0, None, 0, 0, 0, 0])(model, *data)
+        return jax.vmap(self.evaluate_control_loop, in_axes=[None, 0, None, 0, 0, 0, 0, None])(model, *data, eval)
     
-    def evaluate_control_loop(self, model: Tuple, x0: Array, ts: Array, target: Array, process_noise_key: jrandom.PRNGKey, obs_noise_key: jrandom.PRNGKey, params: Tuple) -> Tuple[Array, Array, Array, float]:
+    def evaluate_control_loop(self, model: Tuple, x0: Array, ts: Array, target: Array, process_noise_key: jrandom.PRNGKey, obs_noise_key: jrandom.PRNGKey, params: Tuple, eval) -> Tuple[Array, Array, Array, float]:
         """Solves the coupled differential equation of the system and controller. The differential equation of the system is defined in the environment.
 
         :param model: Model with trees for the hidden state and readout
@@ -62,12 +62,14 @@ class Evaluator:
         env = copy.copy(self.env)
         env.initialize_parameters(params, ts)
 
-        policy = model[0]
+        policy = model
 
         #Define state equation
         def _drift(t, x, args):
             _, y = env.f_obs(obs_noise_key, (t, x)) #Get observations from system
-            u = policy({"y":y, "tar":target}) #Readout control from hidden state
+            # u = policy({"y":y, "tar":target}) #Readout control from hidden state
+            u = eval(policy, jnp.concatenate([y, target]))
+
 
             dx = env.drift(t, x, u) #Apply control to system and get system change
             return dx
@@ -75,9 +77,9 @@ class Evaluator:
         #Define diffusion
         def _diffusion(t, x, args):
             _, y = env.f_obs(obs_noise_key, (t, x))
-            u = policy({"y":y, "tar":target})
+            # u = policy({"y":y, "tar":target})
             # u = a
-            return env.diffusion(t, x, u)
+            return env.diffusion(t, x, jnp.array([0]))
         
         solver = diffrax.EulerHeun()
         dt0 = self.dt0
@@ -91,7 +93,7 @@ class Evaluator:
 
         xs = sol.ys
         _, ys = jax.lax.scan(env.f_obs, obs_noise_key, (ts, xs))
-        us = jax.vmap(lambda y, tar: policy({"y":y, "tar":tar}), in_axes=[0,None])(ys, target)
+        us = jax.vmap(lambda y, tar: eval(policy, jnp.concatenate([y, tar])), in_axes=[0,None])(ys, target)
 
         fitness = env.fitness_function(xs, us, target, ts)
 
