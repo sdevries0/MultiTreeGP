@@ -48,7 +48,7 @@ OPERATORS["tanh"] = OperatorNode(lambda x: jnp.tanh(x), "tanh", 1)
 OPERATORS["exp"] = OperatorNode(lambda x: jnp.exp(x), "exp", 1)
 OPERATORS["log"] = OperatorNode(lambda x: jnp.log(x), "log", 1)
 OPERATORS["squareroot"] = OperatorNode(lambda x: jnp.sqrt(x), "√", 1)
-OPERATORS["square"] = OperatorNode(lambda x: x ** 2, "**2", 1, in_front=False)
+OPERATORS["square"] = OperatorNode(lambda x: x ** 2, "squared", 1, in_front=False)
 
 class Expression:
     """

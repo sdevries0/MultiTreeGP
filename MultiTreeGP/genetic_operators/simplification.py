@@ -100,9 +100,9 @@ def sympy_to_tree(sympy_expr: sympy.core.Expr, mode: str) -> list:
             if sympy_expr.args[1]==-1:
                 right_tree = sympy_to_tree(sympy_expr.args[0], "Mul")
                 return [OperatorNode(lambda x, y: x / y, "/", 2),[jnp.array(1.0)],right_tree]
-            # if sympy_expr.args[1]==2:
-            #     right_tree = sympy_to_tree(sympy_expr.args[0], "Add")
-            #     return [OperatorNode(lambda x: x ** 2, "**2", 1, in_front=False),right_tree]
+            if sympy_expr.args[1]==2:
+                right_tree = sympy_to_tree(sympy_expr.args[0], "Add")
+                return [OperatorNode(lambda x: x ** 2, "squared", 1, in_front=False),right_tree]
             else:
                 left_tree = sympy_to_tree(sympy_expr.args[0], "Add")
                 right_tree = sympy_to_tree(sympy_expr.args[1], "Add")

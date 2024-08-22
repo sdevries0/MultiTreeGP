@@ -3,6 +3,7 @@ from jax import Array
 import jax.numpy as jnp
 from typing import Tuple
 import diffrax
+import optimistix as optx
 import time
 from functools import partial
 
@@ -14,10 +15,13 @@ class Evaluator:
         dt0: Step size for solve.
         fitness_function: Function that computes the fitness of a candidate
     """
-    def __init__(self, dt0: float) -> None:
+    def __init__(self, solver: diffrax.AbstractSolver = diffrax.Euler(), dt0: float = 0.01, stepsize_controller: diffrax.AbstractStepSizeController = diffrax.ConstantStepSize()) -> None:
         self.max_fitness = 1e5
         self.dt0 = dt0
         self.fitness_function = lambda pred_ys, true_ys: jnp.mean(jnp.sum(jnp.square(pred_ys-true_ys), axis=-1)) #Mean Squared Error
+        self.system = diffrax.ODETerm(self._drift)
+        self.solver = solver
+        self.stepsize_controller = stepsize_controller
 
     def __call__(self, model: jnp.ndarray, data: Tuple, eval) -> float:
         """Evaluates the model on an environment.
@@ -26,7 +30,8 @@ class Evaluator:
         :param data: The data required to evaluate the model.
         :returns: Fitness of the model.
         """
-        _, fitness = self.evaluate_model(model, data, eval)
+        # model = jnp.concatenate([left, right[:,:,None]], axis=2)
+        fitness, _ = self.evaluate_model(model, data, eval)
 
         nan_or_inf =  jax.vmap(lambda f: jnp.isinf(f) + jnp.isnan(f))(fitness)
         fitness = jnp.where(nan_or_inf, jnp.ones(fitness.shape)*self.max_fitness, fitness)
@@ -51,21 +56,23 @@ class Evaluator:
         :param ys: Ground truth data used to compute the fitness.
         :returns: Predictions and fitness of the model.
         """
-
-        #Define state equation
-        def _drift(t, x, args):
-            dx = eval(model, x)
-            return dx
         
-        solver = diffrax.Euler()
-        dt0 = self.dt0
         saveat = diffrax.SaveAt(ts=ts)
+        root_finder = optx.Newton(1e-5, 1e-5, optx.rms_norm)
+        event_nan = diffrax.Event(self.cond_fn_nan)#, root_finder=root_finder) 
 
-        system = diffrax.ODETerm(_drift)
         sol = diffrax.diffeqsolve(
-            system, solver, ts[0], ts[-1], dt0, x0, saveat=saveat, max_steps=16**4
+            self.system, self.solver, ts[0], ts[-1], self.dt0, x0, args=(model, eval), saveat=saveat, max_steps=16**4, stepsize_controller=self.stepsize_controller
         )
 
         fitness = self.fitness_function(sol.ys, ys)
 
-        return sol.ys, fitness
+        return fitness, sol.ys
+    
+    def _drift(self, t, x, args):
+            model, eval = args
+            dx = eval(model, x)
+            return dx
+    
+    def cond_fn_nan(self, t, y, args, **kwargs):
+        return jnp.where(jnp.any(jnp.isinf(y) +jnp.isnan(y)), -1.0, 1.0)

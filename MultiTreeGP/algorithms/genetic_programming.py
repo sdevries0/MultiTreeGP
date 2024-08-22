@@ -5,14 +5,15 @@ print(jax.devices())
 from jax import Array
 
 import jax.numpy as jnp
-import jax.random as jrandom
+import jax.random as jr
 from jax.random import PRNGKey
 import optax
 import equinox as eqx
 from functools import partial
 from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental import mesh_utils
+import sympy
 
 from typing import Tuple, Callable
 import copy
@@ -102,7 +103,7 @@ class GeneticProgramming(Strategy):
                  gradient_optimisation: bool = False,
                  gradient_steps: int = 10) -> None:
         super().__init__(num_generations, population_size, fitness_function)
-        assert len(layer_sizes) == len(expressions), "There is not a set of expressions for every type of layer"
+        # assert len(layer_sizes) == len(expressions), "There is not a set of expressions for every type of layer"
         self.expressions = expressions
         self.layer_sizes = layer_sizes
         self.num_populations = num_populations
@@ -151,34 +152,121 @@ class GeneticProgramming(Strategy):
 
         self.best_fitness_per_population = jnp.zeros((num_generations, self.num_populations))
 
-        func_dict = {}
-        functions = [lambda x, y, _data: 0.0]
+        self.optimizer = optax.adam(learning_rate=0.01, b1=0.8, b2=0.9)
 
-        index = -1
+        func_dict = {}
+        func_to_string = {}
+        functions = [lambda x, y, _data: 0.0, lambda x, y, _data: 0.0]
+
+        self.map_b_to_d = self.create_map_b_to_d(self.max_depth)
+
+        index = -2
         data_index = 0
+        slots = [0, 0]
+
+        self.func_i = -2
 
         for expression in self.expressions:
             for operator in expression.operators:
                 if operator.string not in func_dict:
                     func_dict[operator.string] = index
+                    func_to_string[index] = operator.string
                     if operator.arity==1:
                         functions.append(lambda_func1(operator.f))
+                        slots.append(1)
                     elif operator.arity==2:
                         functions.append(lambda_func2(operator.f))
+                        slots.append(2)
                     index -= 1
+        self.func_j = index + 1
 
+        for expression in self.expressions:
             for leaf in expression.leaf_nodes:
                 if leaf.string not in func_dict:
                     func_dict[leaf.string] = index
+                    func_to_string[index] = leaf.string
                     functions.append(lambda_leaf(data_index))
+                    slots.append(0)
                     index -= 1
                     data_index += 1
+        
+        self.leaf_j = index + 1
+
+        self.slots = jnp.array(slots)
 
         self.func_dict = func_dict
+        self.func_to_string = func_to_string
         self.functions = functions
-        
-        self.vmap_trees = jax.jit(jax.vmap(partial(self.fitness_function, eval = self.vmap_foriloop), in_axes=[0, None]))
+
+        self.partial_ff = partial(self.fitness_function, eval = self.vmap_foriloop)
+        self.jit_optimise = jax.vmap(self.optimise, in_axes=[0, None, None])
+        self.vmap_trees = jax.jit(jax.vmap(self.partial_ff, in_axes=[0, None]))
         self.jit_body_fun = jax.jit(partial(self.body_fun, functions = self.functions))
+
+    def create_map_b_to_d(self, depth):
+        max_nodes = 2**depth-1
+        current_depth = 0
+        map_b_to_d = jnp.zeros(max_nodes)
+        for i in range(max_nodes):
+            if i>0:
+                parent = (i + (i%2) - 2)//2
+                value = map_b_to_d[parent]
+                if (i % 2)==0:
+                    new_value = value + 2**(depth-current_depth+1)
+                else:
+                    new_value = value + 1
+                map_b_to_d = map_b_to_d.at[i].set(new_value)
+            current_depth += i==(2**current_depth-1)
+        return max_nodes - 1 - map_b_to_d
+
+    def sample_FS_node(self, i, carry):
+        key, matrix, open_slots = carry
+        float_key, leaf_key, variable_key, node_key, func_key = jr.split(key, 5)
+        _i = self.map_b_to_d[i].astype(int)
+
+        depth = 0.7**(jnp.log(i+1)/jnp.log(2)).astype(int)
+        float = jr.normal(float_key)
+        leaf = jax.lax.select(jr.uniform(leaf_key)<0.5, -1, jr.randint(variable_key, shape=(), minval=self.leaf_j, maxval=self.func_j))
+        index = jax.lax.select((open_slots < self.max_nodes - i - 1) & (depth<=self.max_init_depth), jax.lax.select(jr.uniform(node_key)<(depth), jr.choice(func_key, a=jnp.arange(self.func_j, self.func_i+1), shape=(), p=jnp.flip(self.expressions[0].operators_prob)), leaf), leaf)
+        index = jax.lax.select(open_slots == 0, 0, index)
+        index = jax.lax.select(i>0, jax.lax.select((self.slots[-jnp.minimum(matrix[self.map_b_to_d[(i + (i%2) - 2)//2].astype(int), 0], 0).astype(int)] + i%2) > 1, index, 0), index)
+
+        matrix = jax.lax.select(self.slots[-1*index] > 0, matrix.at[_i, 1].set(self.map_b_to_d[2*i+1]), matrix.at[_i, 1].set(-1))
+        matrix = jax.lax.select(self.slots[-1*index] > 1, matrix.at[_i, 2].set(self.map_b_to_d[2*i+2]), matrix.at[_i, 2].set(-1))
+
+        matrix = jax.lax.select(index == -1, matrix.at[_i,3].set(float), matrix)
+        matrix = matrix.at[_i, 0].set(index)
+
+        open_slots = jax.lax.select(index == 0, open_slots, jnp.maximum(0, open_slots + self.slots[-1*index] - 1))
+
+        return (jr.fold_in(key, i), matrix, open_slots)
+    
+    def prune_row(self, i, carry, old_matrix):
+        matrix, counter = carry
+
+        _i = 2**self.max_depth - i - 2
+
+        row = old_matrix[_i]
+
+        matrix = jax.lax.select(row[0] != 0, matrix.at[counter].set(row), matrix.at[:,1:3].set(jnp.where(matrix[:,1:3] > _i, matrix[:,1:3]-1, matrix[:,1:3])))
+        counter = jax.lax.select(row[0] != 0, counter - 1, counter)
+
+        return (matrix, counter)
+        
+    def prune_tree(self, matrix):
+        matrix, counter = jax.lax.fori_loop(0, 2**self.max_depth-1, partial(self.prune_row, old_matrix=matrix), (jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (self.max_nodes, 1)), self.max_nodes-1))
+        matrix = matrix.at[:,1:3].set(jnp.where(matrix[:,1:3]>-1, matrix[:,1:3] + counter + 1, matrix[:,1:3]))
+        return matrix
+
+    def sample_tree(self, key):
+        tree = jax.lax.fori_loop(0, 2**self.max_depth-1, self.sample_FS_node, (key, jnp.zeros((2**self.max_depth-1, 4)), 1))[1]
+        return self.prune_tree(tree)
+    
+    def sample_trees(self, key):
+        return jax.vmap(self.sample_tree)(jr.split(key, jnp.sum(self.layer_sizes).item()))
+    
+    def sample_population(self, key):
+        return jax.vmap(self.sample_trees)(jr.split(key, self.population_size))
         
     def initialize_population(self, key: PRNGKey) -> list:
         """Randomly initializes the population.
@@ -187,72 +275,63 @@ class GeneticProgramming(Strategy):
 
         Returns: Population.
         """
-        keys = jrandom.split(key, self.num_populations+1)
-        populations = []
-        for x in range(self.num_populations):
-            population = initialization.sample_trees(keys[x], self.expressions, self.layer_sizes, self.population_size, self.max_init_depth, self.init_method, self.leaf_sd)
-            populations.append(population)
+        keys = jr.split(key, self.num_populations)
+        populations = jax.vmap(self.sample_population)(keys)
 
         return populations
     
-    def map_node(self, tree, matrix, index):
-        _index = index
-        if isinstance(tree[0], jax.numpy.ndarray):
-            matrix = matrix.at[index, 0].set(jnp.abs(tree[0]))
-            if tree[0]>0:
-                matrix = matrix.at[index, 1].set(1)
-            else:
-                matrix = matrix.at[index, 1].set(-1)
+    def tree_to_string(self, tree):
+        if tree[-1,0]==-1:
+            return "{:.2f}".format(tree[-1,3])
+        elif tree[-1,1]<0:
+            return self.func_to_string[tree[-1,0].astype(int).item()]
+        elif tree[-1,2]<0:
+            substring = self.tree_to_string(tree[:tree[-1,1].astype(int)+1])
+            return f"{self.func_to_string[tree[-1,0].astype(int).item()]}({substring})"
         else:
-            matrix = matrix.at[index, 0].set(self.func_dict[str(tree[0])])
-
-            if len(tree)==3:
-                matrix = matrix.at[index, 1].set(index-1)
-                matrix, _index = self.map_node(tree[1], matrix, index-1)
-                matrix = matrix.at[index, 2].set(_index-1)
-                matrix, _index = self.map_node(tree[2], matrix, _index-1)
-            if len(tree)==2:
-                matrix = matrix.at[index, 1].set(index-1)
-                matrix, _index = self.map_node(tree[1], matrix, index-1)
-        return matrix, _index
-
-    def tree_to_matrix(self, candidate):
-        matrix = jnp.zeros((jnp.sum(self.layer_sizes), self.max_nodes, 4))
-
-        trees = candidate()
-
-        for i in range(self.layer_sizes.shape[0]):
-            for j in range(self.layer_sizes[i]):
-                if i > 0:
-                    index = jnp.sum(self.layer_sizes[:i]) + j
-                else:
-                    index = j
-                submatrix, _ = self.map_node(trees[i][j], matrix[index], self.max_nodes - 1)
-                matrix = matrix.at[index].set(submatrix)
-
-        return matrix
-
+            substring1 = self.tree_to_string(tree[:tree[-1,1].astype(int)+1])
+            substring2 = self.tree_to_string(tree[:tree[-1,2].astype(int)+1])
+            return f"({substring1}){self.func_to_string[tree[-1,0].astype(int).item()]}({substring2})"
+        
+    def to_string(self, trees):
+        string_output = ""
+        tree_index = 0
+        layer_index = 0
+        for tree in trees:
+            if tree_index==0:
+                string_output += "["
+            string_output += str(sympy.parsing.sympy_parser.parse_expr(self.tree_to_string(tree)))
+            if tree_index < (self.layer_sizes[layer_index] - 1):
+                string_output += ", "
+                tree_index += 1
+            else:
+                string_output += "]"
+                if layer_index < (self.layer_sizes.shape[0] - 1):
+                    string_output += ", "
+                tree_index = 0
+                layer_index += 1
+        return string_output
+    
     def body_fun(self, i, carry, functions):
         array, data = carry
-        f_idx, a_idx, b_idx, _ = array[i]
+        f_idx, a_idx, b_idx, float = array[i]
     
         x = array[a_idx.astype(int), 3]
         y = array[b_idx.astype(int), 3]
-        value = jax.lax.select(f_idx < 0, jax.lax.switch(-f_idx.astype(int), functions, x, y, data), f_idx * a_idx)
+        value = jax.lax.select(f_idx == -1, float, jax.lax.switch(-f_idx.astype(int), functions, x, y, data))
         
         array = array.at[i, 3].set(value)
 
         return (array, data)
 
-    def foriloop(self, carry, array):
-        data, max_size = carry
-        x, _ = jax.lax.fori_loop(0, max_size, self.jit_body_fun, (array, data))
-        return (data, max_size), x[-1, -1]
+    def foriloop(self, data, array):
+        x, _ = jax.lax.fori_loop(0, self.max_nodes, self.jit_body_fun, (array, data))
+        return data, x[-1, -1]
 
     def vmap_foriloop(self, array, data):
-        _, result = jax.lax.scan(self.foriloop, init=(data, self.max_nodes), xs=array)
+        _, result = jax.lax.scan(self.foriloop, init=data, xs=array)
         # result = jax.vmap(self.foriloop, in_axes=[0, None, None])(array, data, self.max_nodes)
-        return jnp.array(result)
+        return result
     
     def evaluate_population(self, populations: list, data: Tuple) -> Tuple[Array, list]:
         """Evaluates every candidate in population and assigns a fitness.
@@ -262,38 +341,33 @@ class GeneticProgramming(Strategy):
 
         Returns: Fitness and evaluated population.
         """
-      
-        population_matrix = jnp.zeros((self.num_populations*self.population_size, jnp.sum(self.layer_sizes), self.max_nodes, 4))
-
-        # start = time.time()
-        for pop, population in enumerate(populations):
-            for i in range(self.population_size):
-                # population_matrix = population_matrix.at[pop, i].set(self.tree_to_matrix(population[i]))
-                population_matrix = population_matrix.at[i + pop*self.population_size].set(self.tree_to_matrix(population[i]))
-
-        # print("map", time.time()-start)
-
-        # start = time.time()
-
         devices = mesh_utils.create_device_mesh((len(jax.devices('cpu'))))
         mesh = Mesh(devices, axis_names=('i'))
         
-        @partial(shard_map, mesh=mesh, in_specs=(P('i'), P(None)), out_specs=P('i'), check_rep=False)
-        def shard_fn(array, data):
+        @partial(shard_map, mesh=mesh, in_specs=(P('i'), P(None)), out_specs=(P('i'), P('i')), check_rep=False)
+        def shard_eval(array, data):
             result = self.vmap_trees(array, data)
-            return result
+            return result, array
         
-        fitness = shard_fn(population_matrix, data)
+        @partial(shard_map, mesh=mesh, in_specs=(P('i'), P(None)), out_specs=(P('i'), P('i')), check_rep=False)
+        def shard_optimise(array, data):
+            result, _array = self.jit_optimise(array, data, self.gradient_steps)
+            return result, _array
+        
+        start = time.time()
+        flat_populations = populations.reshape(self.num_populations*self.population_size, *populations.shape[2:])
+        flat_populations = jax.device_put(flat_populations, NamedSharding(mesh, P('i')))
+        
+        fitness, optimised_population = shard_optimise(flat_populations, data) if self.gradient_optimisation else shard_eval(flat_populations, data)
+        # fitness = self.vmap_trees(flat_populations, data)
+        # fitness, optimised_population = shard_optimise(flat_populations, data)
+        # print(gradients)
 
         fitness = fitness.reshape((self.num_populations, self.population_size))
 
-        for pop, population in enumerate(populations):
-            for i in range(self.population_size):
-                population[i].set_fitness(fitness[pop, i] + self.size_parsinomy*len(jax.tree_util.tree_leaves(population[i]())))
-
         self.best_fitness_per_population = self.best_fitness_per_population.at[self.current_generation].set(jnp.min(fitness, axis=1))
-        best_solution_of_g = find_best_solution(populations, fitness)
-        best_fitness_of_g = best_solution_of_g.fitness
+        best_solution_of_g = optimised_population[jnp.argmin(fitness)]
+        best_fitness_of_g = jnp.min(fitness)
 
         #Keep track of best solution
         if self.current_generation == 0:
@@ -309,138 +383,128 @@ class GeneticProgramming(Strategy):
             
         self.best_solutions.append(best_solution)
         self.best_fitnesses = self.best_fitnesses.at[self.current_generation].set(best_fitness)
-
         # print("eval", time.time() - start)
 
-        return fitness, populations
+        return fitness, optimised_population.reshape((self.num_populations, self.population_size, *optimised_population.shape[1:]))
     
-    # def replace_ones(self, tree):
-    #     if len(tree) == 3:
-    #         operator = tree[0]
-    #         left_tree, left_bool = self.replace_ones(tree[1])
-    #         right_tree, right_bool = self.replace_ones(tree[2])
-    #         if operator.string == "+" or operator.string == "-":
-    #             if left_bool and right_bool:
-    #                 return [tree[0], left_tree, right_tree], True
-    #             elif left_bool:
-    #                 return [tree[0], left_tree, [OperatorNode(lambda x, y: x * y, "*", 2), [jnp.array(1)], right_tree]], True
-    #             elif right_bool:
-    #                 return [tree[0], [OperatorNode(lambda x, y: x * y, "*", 2), [jnp.array(1)], left_tree], right_tree], True
-    #             else:
-    #                 return [tree[0], [OperatorNode(lambda x, y: x * y, "*", 2), [jnp.array(1)], left_tree], [OperatorNode(lambda x, y: x * y, "*", 2), [jnp.array(1)], right_tree]], True
-    #         else:
-    #             if left_bool or right_bool:
-    #                 return [tree[0], left_tree, right_tree], True
-    #             else:
-    #                 return [tree[0], left_tree, right_tree], False
-    #     if len(tree) ==1:
-    #         if isinstance(tree[0], jax.numpy.ndarray):
-    #             return tree, True
-    #         else:
-    #             return tree, False
-    
-    # def evaluate(self, candidate: TreePolicy, data: Tuple, optimise: bool = False, num_steps: int = 3) -> TreePolicy:
-    #     """Evaluates a candidate and assigns a fitness and optionally optimises the constants in the tree.
-
-    #     :param candidate: Candidate solution.
-    #     :param data: The data required to evaluate the population.
-    #     :param optimise: Whether to optimise the constants in the tree.
-    #     :param num_steps: Number of steps during constant optimisation.
-
-    #     Returns: Optimised and evaluated candidate.
-    #     """
-    #     def optimise_tree(tree, paths):
-    #         params, paths = tree.get_params()
-    #         optim = optax.adam(learning_rate=0.05, b1=0.6, b2=0.85)
-    #         state = optim.init(params)
-
-    #         def loss_f(params, data):
-    #             policy = copy.copy(tree)
-    #             policy.set_params(jnp.array(params), paths)
-    #             f = policy.tree_to_function(self.expressions)
-                
-    #             return self.fitness_function(f, data)
-
-    #         def epoch(_, carry):
-    #             _, params, state = carry
-    #             loss = loss_f(params, data)
-    #             gradient = jax.grad(loss_f)(params, data)
-    #             updates, state = optim.update(gradient, state, params)
-    #             params = jax.tree_util.tree_map(lambda x,y: x+y, params, updates)
-    #             return loss, params, state
-
-    #         loss, params, _ = jax.lax.fori_loop(0, num_steps, epoch, (jnp.array(0), params, state))
-
-    #         # for i in range(num_steps):
-    #         #     loss = loss_f(params, data)
-    #         #     print(loss)
-    #         #     gradient = jax.grad(loss_f)(params, data)
-    #         #     updates, state = optim.update(gradient, state, params)
-    #         #     params = jax.tree_util.tree_map(lambda x,y: x+y, params, updates)
-
-    #         final_tree = copy.copy(tree)
-    #         final_tree.set_params(jnp.array(params), paths)
-
-    #         return loss, final_tree
-        
-    #     fitness = self.fitness_function(candidate.tree_to_function(self.expressions), data)
-
-    #     if optimise and fitness < 500:
-    #         # _candidate, _ = self.replace_ones(candidate())
-    #         # candidate = eqx.tree_at(lambda t: t()[0][0], candidate, _candidate)
-    #         params, paths = candidate.get_params()
-    #         if len(params)>0:
-    #             loss, new_candidate = optimise_tree(candidate, paths)
-
-    #             if loss < fitness:
-    #                 candidate = new_candidate
-    #                 fitness = loss
-
-    #     candidate.set_fitness(fitness)
-    #     return candidate
-
-    def evolve_population(self, population: list, key: PRNGKey) -> list:
-        """Creates a new population by evolving the current population.
-
-        :param population: Population of candidates
-        :param key: Random key.
-
-        Returns: Population with new candidates.
-        """        
-
-        #Migrate individuals between populations every few generations
-        if ((self.current_generation+1)%self.migration_period)==0:
-            key, new_key = jrandom.split(key)
-            population = migration.migrate_populations(population, self.migration_method, self.migration_size, new_key)
-
-        #Check if population has not improved during last generations.
-        self.last_restart = self.last_restart + 1
-        restart = jnp.logical_and(self.last_restart>self.restart_iter_threshold, self.best_fitness_per_population[self.current_generation] >= 
-                                  jnp.array([self.best_fitness_per_population[self.current_generation-self.restart_iter_threshold[i], i] for i in range(self.num_populations)]))
-        self.last_restart = self.last_restart.at[restart].set(0)
+    def increment(self):
         self.current_generation += 1
             
-        keys = jrandom.split(key, self.num_populations+1)
+    def epoch(self, i, carry):
+        tree, state, data, _ = carry
+        # loss, gradient = jax.value_and_grad(self.partial_ff)(jnp.concatenate([static_tree, _tree[:,:,None]], axis=2), data)
+        loss, gradient = jax.value_and_grad(self.partial_ff)(tree, data)
 
-        new_populations = []
-        for x in range(self.num_populations):
-            new_population = self.update_population(x, population[x], restart[x], keys[x])
-            new_populations.append(new_population)
-        return new_populations
+        # print(gradient.shape, _tree.shape)
+        # new_tree = tree - 0.1 * gradient
+        updates, state = self.optimizer.update(gradient, state, tree)
+        new_tree = tree + updates
+        # return (tree, state), loss
+        return new_tree, state, data, loss
+
+    def optimise(self, tree, data: Tuple, n_steps):
+        """Evaluates a candidate and assigns a fitness and optionally optimises the constants in the tree.
+
+        :param candidate: Candidate solution.
+        :param data: The data required to evaluate the population.
+        :param optimise: Whether to optimise the constants in the tree.
+        :param num_steps: Number of steps during constant optimisation.
+
+        Returns: Optimised and evaluated candidate.
+        """
+        fitness = self.partial_ff(tree, data)
+        
+        state = self.optimizer.init(tree)
+
+        # (final_tree, _), loss = jax.lax.scan(epoch, (tree, state), xs=[], length=1)
+        # _tree, state, loss = jax.lax.fori_loop(0, 1, epoch, (tree[:,:,3], state, 0))
+        new_tree, _, _, loss = jax.lax.fori_loop(0, n_steps, self.epoch, (tree, state, data, 0))
+
+        fitness = jax.lax.select(loss < fitness, loss, fitness)
+        tree = jax.lax.select(loss < fitness, new_tree, tree)
+
+        return fitness, tree
     
-    def update_population(self, index: int, population: list, restart: bool, key: PRNGKey) -> list:
-        """Either samples or evolves a new subpopulation.
+    def find_end_idx(self, carry):
+        tree, openslots, counter = carry
+        _, idx1, idx2, _ = tree[counter]
+        openslots -= 1
+        openslots = jax.lax.select(idx1 < 0, openslots, openslots+1)
+        openslots = jax.lax.select(idx2 < 0, openslots, openslots+1)
+        counter -= 1
+        return (tree, openslots, counter)
+    
+    def crossover(self, tree1, tree2, key):
+        #Define indices of the nodes
+        tree_indices = jnp.tile(jnp.arange(self.max_nodes)[:,None], reps=(1,4))
+        key1, key2 = jr.split(key)
 
-        :param index: Index of current subpopulation.
-        :param population: Current subpopulation.
-        :param restart: Indicates whether the population should be restarted.
-        :param key: Random key.
+        #Define last node in tree
+        last_node_idx1 = jnp.sum(tree1[:,0]==0)
+        last_node_idx2 = jnp.sum(tree2[:,0]==0)
 
-        Returns: Population with new candidates.
-        """  
-        if restart:
-            print("restart in", index)
-            return initialization.sample_trees(key, self.expressions, self.layer_sizes, self.population_size, self.max_init_depth, self.init_method, self.leaf_sd)
-        else:
-            return reproduction.next_population(population, key, self.expressions, self.layer_sizes, self.reproduction_type_probabilities[index], self.reproduction_probabilities[index], 
-                                        self.mutation_probabilities, self.tournament_probabilities[index], self.tournament_size, self.max_depth, self.max_init_depth, self.max_nodes, self.elite_percentage[index], self.leaf_sd)
+        #Randomly select nodes for crossover
+        node_idx1 = jr.randint(key1, shape=(), minval=last_node_idx1, maxval=self.max_nodes)
+        node_idx2 = jr.randint(key2, shape=(), minval=last_node_idx2, maxval=self.max_nodes)
+
+        #Retrieve subtrees of selected nodes
+        _, _, end_idx1 = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree1, 1, node_idx1))
+        _, _, end_idx2 = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree2, 1, node_idx2))
+
+        #Initialize children
+        child1 = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (self.max_nodes, 1))
+        child2 = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (self.max_nodes, 1))
+
+        #Compute subtree sizes
+        subtree_size1 = node_idx1 - end_idx1
+        subtree_size2 = node_idx2 - end_idx2
+
+        #Insert nodes before subtree in children
+        child1 = jnp.where(tree_indices >= node_idx1 + 1, tree1, child1)
+        child2 = jnp.where(tree_indices >= node_idx2 + 1, tree2, child2)
+        
+        #Align nodes after subtree with first open spot after new subtree in children
+        rolled_tree1 = jnp.roll(tree1, subtree_size1 - subtree_size2, axis=0)
+        rolled_tree2 = jnp.roll(tree2, subtree_size2 - subtree_size1, axis=0)
+
+        #Insert nodes after subtree in children
+        child1 = jnp.where((tree_indices >= jax.lax.max(0, node_idx1 + 1 - subtree_size2 - end_idx1 - 1)) & (tree_indices < node_idx1 + 1 - subtree_size2), rolled_tree1, child1)
+        child2 = jnp.where((tree_indices >= jax.lax.max(0, node_idx2 + 1 - subtree_size1 - end_idx2 - 1)) & (tree_indices < node_idx2 + 1 - subtree_size1), rolled_tree2, child2)
+
+        #Update index references to moved nodes in staying nodes
+        child1 = child1.at[:,1:3].set(jnp.where((child1[:,1:3] < (node_idx1 - subtree_size1 + 1)) & (child1[:,1:3] > -1), child1[:,1:3] + (subtree_size1-subtree_size2), child1[:,1:3]))
+        child2 = child2.at[:,1:3].set(jnp.where((child2[:,1:3] < (node_idx2 - subtree_size2 + 1)) & (child2[:,1:3] > -1), child2[:,1:3] + (subtree_size2-subtree_size1), child2[:,1:3]))
+
+        #Align subtree with the selected node in children
+        rolled_subtree1 = jnp.roll(tree1, node_idx2 - node_idx1, axis=0)
+        rolled_subtree2 = jnp.roll(tree2, node_idx1 - node_idx2, axis=0)
+
+        #Update index references in subtree
+        rolled_subtree1 = rolled_subtree1.at[:,1:3].set(jnp.where(rolled_subtree1[:,1:3] > -1, rolled_subtree1[:,1:3] + (node_idx2 - node_idx1), -1))
+        rolled_subtree2 = rolled_subtree2.at[:,1:3].set(jnp.where(rolled_subtree2[:,1:3] > -1, rolled_subtree2[:,1:3] + (node_idx1 - node_idx2), -1))
+
+        #Insert subtree in selected node in children
+        child1 = jnp.where((tree_indices >= node_idx1 + 1 - subtree_size2) & (tree_indices < node_idx1 + 1), rolled_subtree2, child1)
+        child2 = jnp.where((tree_indices >= node_idx2 + 1 - subtree_size1) & (tree_indices < node_idx2 + 1), rolled_subtree1, child2)
+        
+        return child1, child2
+    
+    def crossover_trees(self, parent1, parent2, key):
+        return jax.vmap(self.crossover)(parent1, parent2, key)
+
+    def tournament_selection(self, population, fitness, key):
+        tournament_key, winner_key = jr.split(key)
+        indices = jr.choice(tournament_key, jnp.arange(self.population_size), shape=(self.tournament_size,))
+        index = jr.choice(winner_key, indices, p=1/(fitness[indices]))
+        return population[index]
+    
+    def evolve_population(self, population, fitness, key):
+        left_key, right_key, cx_key = jr.split(key, 3)
+        left_parents = jax.vmap(self.tournament_selection, in_axes=[None, None, 0])(population, fitness, jr.split(left_key, self.population_size//2))
+        right_parents = jax.vmap(self.tournament_selection, in_axes=[None, None, 0])(population, fitness, jr.split(right_key, self.population_size//2))
+        left_children, right_children = jax.vmap(self.crossover_trees)(left_parents, right_parents, jr.split(cx_key, (self.population_size//2, jnp.sum(self.layer_sizes).item())))
+        return jnp.concatenate([left_children, right_children], axis=0)
+
+    def evolve(self, populations, fitness, key):
+        new_population = jax.vmap(self.evolve_population)(populations, fitness, jr.split(key, self.num_populations))
+        return new_population
