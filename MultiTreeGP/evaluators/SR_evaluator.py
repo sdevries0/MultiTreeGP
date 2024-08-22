@@ -13,10 +13,12 @@ class Evaluator:
         dt0: Step size for solve.
         fitness_function: Function that computes the fitness of a candidate
     """
-    def __init__(self, dt0: float) -> None:
+    def __init__(self, solver: diffrax.AbstractSolver = diffrax.Euler, dt0: float = 0.01, stepsize_controller:diffrax.AbstractStepSizeController = diffrax.ConstantStepSize()) -> None:
         self.max_fitness = 1e5
         self.dt0 = dt0
         self.fitness_function = lambda pred_ys, true_ys: jnp.mean(jnp.sum(jnp.square(pred_ys-true_ys), axis=-1)) #Mean Squared Error
+        self.solver = solver
+        self.stepsize_controller = stepsize_controller
 
     def __call__(self, model: Tuple, data: Tuple) -> float:
         """Evaluates the model on an environment.
@@ -55,19 +57,16 @@ class Evaluator:
 
         #Define state equation
         def _drift(t, x, args):
-            dx = model(data=x)
+            dx = model({"x":x})
             return dx
         
-        solver = diffrax.Euler()
         dt0 = self.dt0
         saveat = diffrax.SaveAt(ts=ts)
 
         system = diffrax.ODETerm(_drift)
-        start = time.time()
         sol = diffrax.diffeqsolve(
-            system, solver, ts[0], ts[-1], dt0, x0, saveat=saveat, max_steps=16**4
+            system, self.solver, ts[0], ts[-1], dt0, x0, saveat=saveat, max_steps=16**4, stepsize_controller=self.stepsize_controller
         )
-        print("end", time.time() - start)
 
         fitness = self.fitness_function(sol.ys, ys)
 
