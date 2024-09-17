@@ -240,7 +240,7 @@ def mutate_tree(mutation_probabilities: Array, expressions: Expression, tree: li
     elif mutation_type=="sample_subtree":
         new_tree = initialization.grow_node(new_key2, expressions, depth=max_init_depth, leaf_sd=leaf_sd)
     elif mutation_type=="add_subtree":
-        new_tree = add_subtree(expressions, tree, new_key2, leaf_sd)        
+        new_tree = add_subtree(expressions, tree, new_key2, leaf_sd)
     return new_tree
 
 def mutate_trees(parent: TreePolicy, layer_sizes: Array, key: PRNGKey, reproduction_probability: float, mutation_probabilities: Array, expressions: list, max_init_depth: int, leaf_sd: float) -> TreePolicy:

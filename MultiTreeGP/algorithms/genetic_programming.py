@@ -95,14 +95,12 @@ class GeneticProgramming(Strategy):
                  tournament_size: int = 7, 
                  init_method: str = "ramped", 
                  size_parsinomy: float = 1.0, 
-                 migration_method: str = "ring", 
                  migration_period: int = 5,
                  leaf_sd: float = 1.0, 
                  migration_percentage: float = 0.1,
                  restart_iter_threshold: int = None,
                  gradient_optimisation: bool = False,
                  gradient_steps: int = 10) -> None:
-        super().__init__(num_generations, population_size, fitness_function)
         # assert len(layer_sizes) == len(expressions), "There is not a set of expressions for every type of layer"
         self.expressions = expressions
         self.layer_sizes = layer_sizes
@@ -110,6 +108,9 @@ class GeneticProgramming(Strategy):
         self.max_depth = max_depth
         self.max_init_depth = max_init_depth
         self.max_nodes = min(max_nodes, 2**self.max_depth-1)
+        self.num_trees = jnp.sum(self.layer_sizes)
+        super().__init__(num_generations, population_size, fitness_function, (self.num_trees, self.max_nodes, 4))
+
         self.init_method = init_method
         if (init_method=="ramped") or (init_method=="full"):
             assert 2**self.max_init_depth < self.max_nodes, "Full trees are not possible given initialization depth and max size"
@@ -118,7 +119,6 @@ class GeneticProgramming(Strategy):
         self.leaf_sd = leaf_sd
 
         self.migration_period = migration_period
-        self.migration_method = migration_method
         self.migration_size = int(migration_percentage*population_size)
 
         self.gradient_optimisation = gradient_optimisation
@@ -135,20 +135,12 @@ class GeneticProgramming(Strategy):
         self.selection_pressures = jnp.linspace(0.6,0.9,self.num_populations)
         self.tournament_probabilities = jnp.array([sp*(1-sp)**jnp.arange(self.tournament_size) for sp in self.selection_pressures])
         
-        self.reproduction_type_probabilities = jnp.vstack([jnp.linspace(0.9,0.5,self.num_populations),jnp.linspace(0.1,0.5,self.num_populations),
-                                         jnp.linspace(0.0,0.0,self.num_populations),jnp.linspace(0.0,0.0,self.num_populations)]).T
+        self.reproduction_type_probabilities = jnp.vstack([jnp.linspace(0.9,0.2,self.num_populations),jnp.linspace(0.1,0.8,self.num_populations)
+                                                           ,jnp.linspace(0.0,0.0,self.num_populations)]).T
         self.reproduction_probabilities = jnp.linspace(1.0, 0.5, self.num_populations)
         self.elite_percentage = jnp.linspace(0.04, 0.04)
 
-        self.mutation_probabilities = {}
-        self.mutation_probabilities["mutate_operator"] = 0.5
-        self.mutation_probabilities["delete_operator"] = 0.5
-        self.mutation_probabilities["insert_operator"] = 1.0
-        self.mutation_probabilities["mutate_constant"] = 0.1
-        self.mutation_probabilities["mutate_leaf"] = 0.5
-        self.mutation_probabilities["sample_subtree"] = 1.0
-        self.mutation_probabilities["prepend_operator"] = 1.0
-        self.mutation_probabilities["add_subtree"] = 1.0
+        self.mutate_functions = [self.add_subtree, self.mutate_leaf, self.mutate_operator, self.delete_operator, self.prepend_operator, self.insert_operator, self.replace_tree]
 
         self.best_fitness_per_population = jnp.zeros((num_generations, self.num_populations))
 
@@ -159,6 +151,8 @@ class GeneticProgramming(Strategy):
         functions = [lambda x, y, _data: 0.0, lambda x, y, _data: 0.0]
 
         self.map_b_to_d = self.create_map_b_to_d(self.max_depth)
+
+        self.jit_evolve_population = jax.jit(self.evolve_population)
 
         index = -2
         data_index = 0
@@ -220,14 +214,18 @@ class GeneticProgramming(Strategy):
         return max_nodes - 1 - map_b_to_d
 
     def sample_FS_node(self, i, carry):
-        key, matrix, open_slots = carry
+        key, matrix, open_slots, max_depth = carry
         float_key, leaf_key, variable_key, node_key, func_key = jr.split(key, 5)
         _i = self.map_b_to_d[i].astype(int)
 
-        depth = 0.7**(jnp.log(i+1)/jnp.log(2)).astype(int)
-        float = jr.normal(float_key)
+        depth = (jnp.log(i+1)/jnp.log(2)).astype(int)
+        float = jr.normal(float_key)*self.leaf_sd
         leaf = jax.lax.select(jr.uniform(leaf_key)<0.5, -1, jr.randint(variable_key, shape=(), minval=self.leaf_j, maxval=self.func_j))
-        index = jax.lax.select((open_slots < self.max_nodes - i - 1) & (depth<=self.max_init_depth), jax.lax.select(jr.uniform(node_key)<(depth), jr.choice(func_key, a=jnp.arange(self.func_j, self.func_i+1), shape=(), p=jnp.flip(self.expressions[0].operators_prob)), leaf), leaf)
+        index = jax.lax.select((open_slots < self.max_nodes - i - 1) & (depth<max_depth), 
+                               jax.lax.select(jr.uniform(node_key)<(0.7**depth), 
+                                              jr.choice(func_key, a=jnp.arange(self.func_j, self.func_i+1), shape=(), p=jnp.flip(self.expressions[0].operators_prob)), 
+                                              leaf), 
+                               leaf)
         index = jax.lax.select(open_slots == 0, 0, index)
         index = jax.lax.select(i>0, jax.lax.select((self.slots[-jnp.minimum(matrix[self.map_b_to_d[(i + (i%2) - 2)//2].astype(int), 0], 0).astype(int)] + i%2) > 1, index, 0), index)
 
@@ -239,7 +237,7 @@ class GeneticProgramming(Strategy):
 
         open_slots = jax.lax.select(index == 0, open_slots, jnp.maximum(0, open_slots + self.slots[-1*index] - 1))
 
-        return (jr.fold_in(key, i), matrix, open_slots)
+        return (jr.fold_in(key, i), matrix, open_slots, max_depth)
     
     def prune_row(self, i, carry, old_matrix):
         matrix, counter = carry
@@ -258,15 +256,15 @@ class GeneticProgramming(Strategy):
         matrix = matrix.at[:,1:3].set(jnp.where(matrix[:,1:3]>-1, matrix[:,1:3] + counter + 1, matrix[:,1:3]))
         return matrix
 
-    def sample_tree(self, key):
-        tree = jax.lax.fori_loop(0, 2**self.max_depth-1, self.sample_FS_node, (key, jnp.zeros((2**self.max_depth-1, 4)), 1))[1]
+    def sample_tree(self, key, depth):
+        tree = jax.lax.fori_loop(0, 2**self.max_depth-1, self.sample_FS_node, (key, jnp.zeros((2**self.max_depth-1, 4)), 1, depth))[1]
         return self.prune_tree(tree)
     
-    def sample_trees(self, key):
-        return jax.vmap(self.sample_tree)(jr.split(key, jnp.sum(self.layer_sizes).item()))
+    def sample_trees(self, keys, depth):
+        return jax.vmap(self.sample_tree, in_axes=[0, None])(keys, depth)
     
     def sample_population(self, key):
-        return jax.vmap(self.sample_trees)(jr.split(key, self.population_size))
+        return jax.vmap(self.sample_trees, in_axes=[0, None])(jr.split(key, (self.population_size, self.num_trees)), self.max_init_depth)
         
     def initialize_population(self, key: PRNGKey) -> list:
         """Randomly initializes the population.
@@ -354,15 +352,14 @@ class GeneticProgramming(Strategy):
             result, _array = self.jit_optimise(array, data, self.gradient_steps)
             return result, _array
         
-        start = time.time()
         flat_populations = populations.reshape(self.num_populations*self.population_size, *populations.shape[2:])
         flat_populations = jax.device_put(flat_populations, NamedSharding(mesh, P('i')))
         
         fitness, optimised_population = shard_optimise(flat_populations, data) if self.gradient_optimisation else shard_eval(flat_populations, data)
+        fitness = fitness + jax.vmap(lambda array: self.size_parsinomy * jnp.sum(array[:,:,0]!=0))(flat_populations)
         # fitness = self.vmap_trees(flat_populations, data)
         # fitness, optimised_population = shard_optimise(flat_populations, data)
         # print(gradients)
-
         fitness = fitness.reshape((self.num_populations, self.population_size))
 
         self.best_fitness_per_population = self.best_fitness_per_population.at[self.current_generation].set(jnp.min(fitness, axis=1))
@@ -381,14 +378,10 @@ class GeneticProgramming(Strategy):
                 best_fitness = best_fitness_of_g
                 best_solution = best_solution_of_g
             
-        self.best_solutions.append(best_solution)
+        self.best_solutions = self.best_solutions.at[self.current_generation].set(best_solution)
         self.best_fitnesses = self.best_fitnesses.at[self.current_generation].set(best_fitness)
-        # print("eval", time.time() - start)
 
-        return fitness, optimised_population.reshape((self.num_populations, self.population_size, *optimised_population.shape[1:]))
-    
-    def increment(self):
-        self.current_generation += 1
+        return fitness, optimised_population.reshape((self.num_populations, self.population_size, *optimised_population.shape[1:]))      
             
     def epoch(self, i, carry):
         tree, state, data, _ = carry
@@ -425,6 +418,11 @@ class GeneticProgramming(Strategy):
 
         return fitness, tree
     
+    def sample_indices(self, carry):
+        _key, prev, reproduction_probability = carry
+        indices = jr.bernoulli(_key, p=reproduction_probability, shape=prev.shape)*1.0
+        return (jr.split(_key, 1)[0], indices, reproduction_probability)
+
     def find_end_idx(self, carry):
         tree, openslots, counter = carry
         _, idx1, idx2, _ = tree[counter]
@@ -434,18 +432,54 @@ class GeneticProgramming(Strategy):
         counter -= 1
         return (tree, openslots, counter)
     
-    def crossover(self, tree1, tree2, key):
+    def check_invalid_cx_points(self, carry):
+        tree1, tree2, _, node_idx1, node_idx2 = carry
+
+        _, _, end_idx1 = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree1, 1, node_idx1))
+        _, _, end_idx2 = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree2, 1, node_idx2))
+
+        subtree_size1 = node_idx1 - end_idx1
+        subtree_size2 = node_idx2 - end_idx2
+
+        empty_nodes1 = jnp.sum(tree1[:,0]==0)
+        empty_nodes2 = jnp.sum(tree2[:,0]==0)
+
+        return (empty_nodes1 < subtree_size2 - subtree_size1) | (empty_nodes2 < subtree_size1 - subtree_size2)
+
+    def sample_cx_points(self, carry):
+        tree1, tree2, keys, _, _ = carry
+        key1, key2 = keys
+
+        cx_prob1 = (tree1[:,0] <= self.func_i) & (tree1[:,0] >= self.func_j)
+        cx_prob1 = jnp.where(tree1[:,0]==0, cx_prob1, cx_prob1+1)
+        node_idx1 = jr.choice(key1, jnp.arange(self.max_nodes), p = cx_prob1*1.)
+
+        cx_prob2 = (tree2[:,0] <= self.func_i) & (tree2[:,0] >= self.func_j)
+        cx_prob2 = jnp.where(tree2[:,0]==0, cx_prob2, cx_prob2+1)
+        node_idx2 = jr.choice(key2, jnp.arange(self.max_nodes), p = cx_prob2*1.)
+
+        return (tree1, tree2, jr.split(key1), node_idx1, node_idx2)
+    
+    def crossover(self, tree1, tree2, keys):
         #Define indices of the nodes
         tree_indices = jnp.tile(jnp.arange(self.max_nodes)[:,None], reps=(1,4))
-        key1, key2 = jr.split(key)
+        key1, key2 = keys
 
         #Define last node in tree
         last_node_idx1 = jnp.sum(tree1[:,0]==0)
         last_node_idx2 = jnp.sum(tree2[:,0]==0)
 
         #Randomly select nodes for crossover
-        node_idx1 = jr.randint(key1, shape=(), minval=last_node_idx1, maxval=self.max_nodes)
-        node_idx2 = jr.randint(key2, shape=(), minval=last_node_idx2, maxval=self.max_nodes)
+        cx_prob1 = (tree1[:,0] <= self.func_i) & (tree1[:,0] >= self.func_j)
+        cx_prob1 = jnp.where(tree1[:,0]==0, cx_prob1, cx_prob1+1)
+        node_idx1 = jr.choice(key1, jnp.arange(self.max_nodes), p = cx_prob1*1.)
+
+        cx_prob2 = (tree2[:,0] <= self.func_i) & (tree2[:,0] >= self.func_j)
+        cx_prob2 = jnp.where(tree2[:,0]==0, cx_prob2, cx_prob2+1)
+        node_idx2 = jr.choice(key2, jnp.arange(self.max_nodes), p = cx_prob2*1.)
+
+        #Reselect until valid crossover points have been found
+        _, _, _, node_idx1, node_idx2 = jax.lax.while_loop(self.check_invalid_cx_points, self.sample_cx_points, (tree1, tree2, jr.split(key1), node_idx1, node_idx2))
 
         #Retrieve subtrees of selected nodes
         _, _, end_idx1 = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree1, 1, node_idx1))
@@ -468,8 +502,8 @@ class GeneticProgramming(Strategy):
         rolled_tree2 = jnp.roll(tree2, subtree_size2 - subtree_size1, axis=0)
 
         #Insert nodes after subtree in children
-        child1 = jnp.where((tree_indices >= jax.lax.max(0, node_idx1 + 1 - subtree_size2 - end_idx1 - 1)) & (tree_indices < node_idx1 + 1 - subtree_size2), rolled_tree1, child1)
-        child2 = jnp.where((tree_indices >= jax.lax.max(0, node_idx2 + 1 - subtree_size1 - end_idx2 - 1)) & (tree_indices < node_idx2 + 1 - subtree_size1), rolled_tree2, child2)
+        child1 = jnp.where((tree_indices >= node_idx1 - subtree_size2 - (end_idx1 - last_node_idx1)) & (tree_indices < node_idx1 + 1 - subtree_size2), rolled_tree1, child1)
+        child2 = jnp.where((tree_indices >= node_idx2 - subtree_size1 - (end_idx2 - last_node_idx2)) & (tree_indices < node_idx2 + 1 - subtree_size1), rolled_tree2, child2)
 
         #Update index references to moved nodes in staying nodes
         child1 = child1.at[:,1:3].set(jnp.where((child1[:,1:3] < (node_idx1 - subtree_size1 + 1)) & (child1[:,1:3] > -1), child1[:,1:3] + (subtree_size1-subtree_size2), child1[:,1:3]))
@@ -489,22 +523,335 @@ class GeneticProgramming(Strategy):
         
         return child1, child2
     
-    def crossover_trees(self, parent1, parent2, key):
-        return jax.vmap(self.crossover)(parent1, parent2, key)
+    def crossover_trees(self, parent1, parent2, keys, reproduction_probability):
+        _, cx_indices, _ = jax.lax.while_loop(lambda carry: jnp.sum(carry[1])==0, self.sample_indices, (keys[0, 0], jnp.zeros(parent1.shape[0]), reproduction_probability))
+        offspring1, offspring2 = jax.vmap(self.crossover)(parent1, parent2, keys)
+        child1 = jnp.where(cx_indices[:,None,None] * jnp.ones_like(parent1), offspring1, parent1)
+        child2 = jnp.where(cx_indices[:,None,None] * jnp.ones_like(parent2), offspring2, parent2)
+        return child1, child2
 
-    def tournament_selection(self, population, fitness, key):
+    def add_subtree(self, tree, key):
+        tree_indices = jnp.tile(jnp.arange(self.max_nodes)[:,None], reps=(1,4))
+        select_key, sample_key = jr.split(key, 2)
+        node_ids = tree[:,0]
+        is_leaf = (node_ids == -1) | (node_ids < self.func_j)
+        mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_leaf*1.)
+
+        subtree = self.sample_tree(sample_key, depth=2)
+        subtree_size = jnp.sum(subtree[:,0]!=0)
+
+        remaining_size = mutate_idx - jnp.sum(tree[:,0]==0)
+
+        child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (self.max_nodes, 1))
+        child = jnp.where(tree_indices > mutate_idx, tree, child)
+
+        rolled_tree = jnp.roll(tree, -subtree_size + 1, axis=0)
+        child = jnp.where((tree_indices <= mutate_idx - subtree_size) & (tree_indices > mutate_idx - subtree_size - remaining_size), rolled_tree, child)
+        child = child.at[:,1:3].set(jnp.where((child[:,1:3] < (mutate_idx)) & (child[:,1:3] > -1), child[:,1:3] - (subtree_size - 1), child[:,1:3]))
+
+        subtree = jnp.roll(subtree, -(self.max_nodes - mutate_idx - 1), axis=0)
+        subtree = subtree.at[:,1:3].set(jnp.where(subtree[:,1:3] > -1, subtree[:,1:3] + (mutate_idx - self.max_nodes + 1), -1))
+        child = jnp.where((tree_indices <= mutate_idx) & (tree_indices > mutate_idx - subtree_size), subtree, child)
+
+        return child
+
+    def sample_leaf_point(self, carry):
+        tree, key, _, _ = carry
+        key, select_key, sample_key, variable_key = jr.split(key, 4)
+        node_ids = tree[:,0]
+        is_leaf = (node_ids == -1) | (node_ids < self.func_j)
+        mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_leaf*1.)
+        new_leaf = jax.lax.select(jr.uniform(sample_key)<0.5, -1, jr.randint(variable_key, shape=(), minval=self.leaf_j, maxval=self.func_j))
+
+        return (tree, key, mutate_idx, new_leaf)
+    
+    def check_equal_leaves(self, carry):
+        tree, key, mutate_idx, new_leaf = carry
+
+        return (tree[mutate_idx, 0] == new_leaf) & (new_leaf != -1)
+
+    def mutate_leaf(self, tree, key):
+        select_key, sample_key, float_key, variable_key = jr.split(key, 4)
+        node_ids = tree[:,0]
+        is_leaf = (node_ids == -1) | (node_ids < self.func_j)
+        mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_leaf*1.)
+        new_leaf = jax.lax.select(jr.uniform(sample_key)<0.5, -1, jr.randint(variable_key, shape=(), minval=self.leaf_j, maxval=self.func_j))
+        _, _, mutate_idx, new_leaf = jax.lax.while_loop(self.check_equal_leaves, self.sample_leaf_point, (tree, jr.fold_in(key, 0), mutate_idx, new_leaf))
+
+        float = jr.normal(float_key)
+
+        child = tree.at[mutate_idx, 0].set(new_leaf)
+        child = jax.lax.select(new_leaf==-1, child.at[mutate_idx, 3].set(float), child.at[mutate_idx, 3].set(0))
+
+        return child
+
+    def replace_with_one_subtree(self, tree, mutate_idx, operator, key):
+        tree_indices = jnp.tile(jnp.arange(self.max_nodes)[:,None], reps=(1,4))
+        _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree, 1, mutate_idx))
+
+        remaining_size = end_idx - jnp.sum(tree[:,0]==0) + 1
+
+        subtree = self.sample_tree(key, depth=2)
+        subtree_size = jnp.sum(subtree[:,0]!=0)
+
+        child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (self.max_nodes, 1))
+
+        child = jnp.where(tree_indices >= mutate_idx, tree, child)
+
+        rolled_tree = jnp.roll(tree, (mutate_idx - end_idx - subtree_size - 1), axis=0)
+        child = jnp.where((tree_indices < mutate_idx - subtree_size) & (tree_indices >= mutate_idx - subtree_size - remaining_size), rolled_tree, child)
+
+        child = child.at[mutate_idx, 0].set(operator)
+        child = child.at[mutate_idx, 2].set(-1)
+
+        child = child.at[:,1:3].set(jnp.where((child[:,1:3] <= (end_idx)) & (child[:,1:3] > -1), child[:,1:3] + (mutate_idx - end_idx - subtree_size - 1), child[:,1:3]))
+
+        subtree = jnp.roll(subtree, -(self.max_nodes - mutate_idx), axis=0)
+        subtree = subtree.at[:,1:3].set(jnp.where(subtree[:,1:3] > -1, subtree[:,1:3] + (mutate_idx - self.max_nodes), -1))
+        child = jnp.where((tree_indices < mutate_idx) & (tree_indices > mutate_idx - subtree_size - 1), subtree, child)
+
+        return child
+
+    def replace_with_two_subtrees(self, tree, mutate_idx, operator, key):
+        tree_indices = jnp.tile(jnp.arange(self.max_nodes)[:,None], reps=(1,4))
+        key1, key2 = jr.split(key)
+        _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree, 1, mutate_idx))
+
+        remaining_size = end_idx - jnp.sum(tree[:,0]==0) + 1
+
+        subtree1 = self.sample_tree(key1, depth=1)
+        subtree1_size = jnp.sum(subtree1[:,0]!=0)
+        subtree2 = self.sample_tree(key2, depth=1)
+        subtree2_size = jnp.sum(subtree2[:,0]!=0)
+
+        child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (self.max_nodes, 1))
+        child = jnp.where(tree_indices >= mutate_idx, tree, child)
+
+        rolled_tree = jnp.roll(tree, (mutate_idx - end_idx - subtree1_size - subtree2_size - 1), axis=0)
+        child = jnp.where((tree_indices < mutate_idx - subtree1_size - subtree2_size) & (tree_indices >= mutate_idx - subtree1_size - subtree2_size - remaining_size), rolled_tree, child)
+
+        child = child.at[:,1:3].set(jnp.where((child[:,1:3] <= (end_idx)) & (child[:,1:3] > -1), child[:,1:3] + (mutate_idx - end_idx - subtree1_size - subtree2_size - 1), child[:,1:3]))
+
+        child = child.at[mutate_idx, 0].set(operator)
+        child = child.at[mutate_idx, 1].set(mutate_idx - 1)
+        child = child.at[mutate_idx, 2].set(mutate_idx - subtree1_size - 1)
+
+        subtree1 = jnp.roll(subtree1, -(self.max_nodes - mutate_idx), axis=0)
+        subtree1 = subtree1.at[:,1:3].set(jnp.where(subtree1[:,1:3] > -1, subtree1[:,1:3] + (mutate_idx - self.max_nodes), -1))
+        child = jnp.where((tree_indices < mutate_idx) & (tree_indices > mutate_idx - subtree1_size - 1), subtree1, child)
+
+        subtree2 = jnp.roll(subtree2, -(self.max_nodes - mutate_idx + subtree1_size), axis=0)
+        subtree2 = subtree2.at[:,1:3].set(jnp.where(subtree2[:,1:3] > -1, subtree2[:,1:3] + (mutate_idx - subtree1_size - self.max_nodes), -1))
+        child = jnp.where((tree_indices < mutate_idx - subtree1_size) & (tree_indices > mutate_idx - subtree1_size - subtree2_size - 1), subtree2, child)
+
+        return child
+    
+    def check_invalid_operator_point(self, carry):
+        tree, _, mutate_idx, new_operator = carry
+        _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree, 1, mutate_idx))
+
+        subtree_size = mutate_idx - end_idx
+
+        empty_nodes = jnp.sum(tree[:,0]==0)
+        new_tree_size = jax.lax.select(self.slots[-1*new_operator] == 2, 7, 8)
+
+        return (tree[mutate_idx, 0] == new_operator) | (empty_nodes + subtree_size < new_tree_size)
+
+    def sample_operator_point(self, carry):
+        tree, key, _, _ = carry
+        key, select_key, sample_key = jr.split(key, 3)
+
+        node_ids = tree[:,0]
+        is_operator = (node_ids <= self.func_i) & (node_ids >= self.func_j)
+        mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_operator*1.)
+        new_operator = jr.choice(sample_key, a=jnp.arange(self.func_j, self.func_i+1), shape=(), p=jnp.flip(self.expressions[0].operators_prob))
+
+        return (tree, key, mutate_idx, new_operator)
+
+    def mutate_operator(self, tree, key):
+        select_key, sample_key, subtree_key = jr.split(key, 3)
+        node_ids = tree[:,0]
+        is_operator = (node_ids <= self.func_i) & (node_ids >= self.func_j)
+        mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_operator*1.)
+        new_operator = jr.choice(sample_key, a=jnp.arange(self.func_j, self.func_i+1), shape=(), p=jnp.flip(self.expressions[0].operators_prob))
+
+        _, _, mutate_idx, new_operator = jax.lax.while_loop(self.check_invalid_operator_point, self.sample_operator_point, (tree, jr.fold_in(key, 0), mutate_idx, new_operator))
+
+        current_slots = self.slots[-1*node_ids[mutate_idx].astype(int)]
+        new_slots = self.slots[-1*new_operator]
+
+        child = jax.lax.select(current_slots==2, jax.lax.select(new_slots==2, tree.at[mutate_idx, 0].set(new_operator), self.replace_with_one_subtree(tree, mutate_idx, new_operator, subtree_key)), 
+                                   jax.lax.select(new_slots==2, self.replace_with_two_subtrees(tree, mutate_idx, new_operator, subtree_key), tree.at[mutate_idx, 0].set(new_operator)))
+
+        return child
+
+    def delete_operator(self, tree, key):
+        tree_indices = jnp.tile(jnp.arange(self.max_nodes)[:,None], reps=(1,4))
+        select_key, sample_key, float_key, variable_key = jr.split(key, 4)
+        node_ids = tree[:,0]
+        is_operator = (node_ids <= self.func_i) & (node_ids >= self.func_j)
+        is_operator = is_operator.at[-1].set(False)
+        delete_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_operator*1.)
+        _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree, 1, delete_idx))
+
+        remaining_size = end_idx - jnp.sum(tree[:,0]==0) + 1
+
+        float = jr.normal(float_key)
+        new_leaf = jax.lax.select(jr.uniform(sample_key)<0.5, -1, jr.randint(variable_key, shape=(), minval=self.leaf_j, maxval=self.func_j))
+
+        child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (self.max_nodes, 1))
+        child = jnp.where(tree_indices > delete_idx, tree, child)
+
+        rolled_tree = jnp.roll(tree, delete_idx - end_idx - 1, axis=0)
+        child = jnp.where((tree_indices < delete_idx) & (tree_indices >= delete_idx - remaining_size), rolled_tree, child)
+        child = child.at[:,1:3].set(jnp.where((child[:,1:3] <= (delete_idx - 1)) & (child[:,1:3] > -1), child[:,1:3] + (delete_idx - end_idx - 1), child[:,1:3]))
+
+        child = child.at[delete_idx, 0].set(new_leaf)
+        child = jax.lax.select(new_leaf==-1, child.at[delete_idx, 3].set(float), child.at[delete_idx, 3].set(0))
+
+        return child
+
+    def prepend_operator(self, tree, key):
+        tree_indices = jnp.tile(jnp.arange(self.max_nodes)[:,None], reps=(1,4))
+        sample_key, subtree_key, side_key = jr.split(key, 3)
+        new_operator = jr.choice(sample_key, a=jnp.arange(self.func_j, self.func_i+1), shape=(), p=jnp.flip(self.expressions[0].operators_prob))
+        new_slots = self.slots[-1*new_operator]
+        subtree = self.sample_tree(subtree_key, depth=2)
+        subtree_size = jnp.sum(subtree[:,0]!=0)
+        tree_size = jnp.sum(tree[:,0]!=0)
+
+        second_branch = jr.bernoulli(side_key)
+
+        child = jnp.roll(tree, -1 - (new_slots - 1) * second_branch*subtree_size, axis=0)
+        child = child.at[:,1:3].set(jnp.where(child[:,1:3] > -1, child[:,1:3] - 1 - (new_slots - 1) * second_branch*subtree_size, child[:,1:3]))
+
+        rolled_subtree = jnp.roll(subtree, -1 - (1-second_branch) * tree_size, axis=0)
+        rolled_subtree = rolled_subtree.at[:,1:3].set(jnp.where(rolled_subtree[:,1:3] > -1, rolled_subtree[:,1:3] - 1 - (1-second_branch)*tree_size, rolled_subtree[:,1:3]))
+
+        child_2_branches = jax.lax.select(second_branch, jnp.where((tree_indices < self.max_nodes - 1) & (tree_indices >= self.max_nodes - subtree_size - 1), rolled_subtree, child), jnp.where((tree_indices < self.max_nodes - tree_size - 1) & (tree_indices >= self.max_nodes - tree_size - subtree_size - 1), rolled_subtree, child))
+
+        child = jax.lax.select(new_slots==2, child_2_branches, child)
+        child = child.at[-1, 0].set(new_operator)
+        child = child.at[-1, 1].set(self.max_nodes - 2)
+        child = child.at[-1, 2].set(jax.lax.select(new_slots==2, self.max_nodes - jax.lax.select(second_branch, subtree_size, tree_size) - 2, -1))
+
+        return child
+
+    def insert_operator(self, tree, key):
+        tree_indices = jnp.tile(jnp.arange(self.max_nodes)[:,None], reps=(1,4))
+        select_key, sample_key, subtree_key, side_key = jr.split(key, 4)
+        node_ids = tree[:,0]
+        is_operator = (node_ids <= self.func_i) & (node_ids >= self.func_j)
+        is_operator = is_operator.at[-1].set(False)
+        mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_operator*1.)
+        _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, self.find_end_idx, (tree, 1, mutate_idx))
+
+        new_operator = jr.choice(sample_key, a=jnp.arange(self.func_j, self.func_i+1), shape=(), p=jnp.flip(self.expressions[0].operators_prob))
+        new_slots = self.slots[-1*new_operator]
+        subtree = self.sample_tree(subtree_key, depth=2)
+        subtree_size = jnp.sum(subtree[:,0]!=0)
+        tree_size = mutate_idx - end_idx
+
+        second_branch = jr.bernoulli(side_key)
+
+        child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (self.max_nodes, 1))
+        child = jnp.where(tree_indices > mutate_idx, tree, child)
+        child = jnp.where(tree_indices < end_idx - (new_slots - 1) * subtree_size, jnp.roll(tree, -(new_slots - 1) * subtree_size - 1, axis=0), child)
+        child = child.at[:,1:3].set(jnp.where((child[:,1:3] <= (end_idx)) & (child[:,1:3] > -1), child[:,1:3] - (new_slots - 1) * subtree_size - 1, child[:,1:3]))
+
+        rolled_tree = jnp.roll(tree, - (new_slots - 1) * second_branch * subtree_size - 1, axis=0)
+        rolled_tree = rolled_tree.at[:,1:3].set(jnp.where(rolled_tree[:,1:3] > -1, rolled_tree[:,1:3] - 1 - (new_slots - 1) * second_branch*subtree_size, rolled_tree[:,1:3]))
+
+        rolled_subtree = jnp.roll(subtree, mutate_idx - self.max_nodes - (1-second_branch) * tree_size, axis=0)
+        rolled_subtree = rolled_subtree.at[:,1:3].set(jnp.where(rolled_subtree[:,1:3] > -1, rolled_subtree[:,1:3] - (self.max_nodes - mutate_idx) - (1-second_branch)*tree_size, rolled_subtree[:,1:3]))
+
+        lower_tree = jax.lax.select(second_branch, jnp.where(tree_indices <= mutate_idx - subtree_size - 1, rolled_tree, rolled_subtree), 
+                                jnp.where(tree_indices <= end_idx - 1, rolled_subtree, rolled_tree))
+        
+        child_2_branches = jnp.where((tree_indices <= mutate_idx - 1) & (tree_indices > mutate_idx - subtree_size - tree_size - 1), lower_tree, child)
+
+        child_1_branch = jnp.where((tree_indices <= mutate_idx - 1) & (tree_indices >= mutate_idx - tree_size), rolled_tree, child)
+        
+        child = jax.lax.select(new_slots==2, child_2_branches, child_1_branch)
+        child = child.at[mutate_idx, 0].set(new_operator)
+        child = child.at[mutate_idx, 1].set(mutate_idx - 1)
+        child = child.at[mutate_idx, 2].set(jax.lax.select(new_slots==2, mutate_idx - jax.lax.select(second_branch, subtree_size, tree_size) - 1, -1))
+
+        return child
+
+    def replace_tree(self, tree, key):
+        return self.sample_tree(key, self.max_init_depth)
+
+    def sample_pair(self, parent1, parent2, keys, reproduction_probability):
+        offspring = jax.vmap(self.sample_trees, in_axes=[1, None])(keys, self.max_init_depth)
+        return offspring[0], offspring[1]
+    
+    def mutate_tree(self, tree, key, mutate_function):
+        return jax.lax.switch(mutate_function, self.mutate_functions, tree, key)
+    
+    def get_mutations(self, tree, key):
+        [self.add_subtree, self.mutate_leaf, self.mutate_operator, self.delete_operator, self.prepend_operator, self.insert_operator, self.replace_tree]
+        mutation_probs = jnp.ones(len(self.mutate_functions))
+        [self.add_subtree, self.mutate_leaf, self.mutate_operator, self.delete_operator, self.prepend_operator, self.insert_operator, self.replace_tree]
+        mutation_probs = jax.lax.select(jnp.sum(tree[:,0]==0) < 8, jnp.array([0., 1., 1., 1., 0., 0., 1.]), mutation_probs)
+        mutation_probs = jax.lax.select(jnp.sum(tree[:,0]!=0) <= 3, jnp.array([1., 1., 1., 0., 1., 0., 1.]), mutation_probs)
+        mutation_probs = jax.lax.select(jnp.sum(tree[:,0]!=0) == 1, jnp.array([1., 1., 0., 0., 1., 0., 1.]), mutation_probs)
+        
+        return jr.choice(key, jnp.arange(len(self.mutate_functions)), p=mutation_probs)
+    
+    def mutate_trees(self, trees, keys, reproduction_probability):
+        index_key, func_key = jr.split(keys[0])
+        _, mutate_indices, _ = jax.lax.while_loop(lambda carry: jnp.sum(carry[1])==0, self.sample_indices, (index_key, jnp.zeros(trees.shape[0]), reproduction_probability))
+        mutate_functions = jax.vmap(self.get_mutations)(trees, keys)
+
+        mutated_trees = jax.vmap(self.mutate_tree)(trees, keys, mutate_functions)
+
+        return jnp.where(mutate_indices[:,None,None] * jnp.ones_like(trees), mutated_trees, trees)
+    
+    def mutate_pair(self, parent1, parent2, keys, reproduction_probability):
+        child1 = self.mutate_trees(parent1, keys[:,0], reproduction_probability)
+        child2 = self.mutate_trees(parent2, keys[:,1], reproduction_probability)
+        return child1, child2
+
+    def evolve_trees(self, parent1, parent2, keys, type, reproduction_probability):
+        child1, child2 = jax.lax.switch(type, [self.crossover_trees, self.mutate_pair, self.sample_pair], parent1, parent2, keys, reproduction_probability)
+
+        return child1, child2
+
+    def tournament_selection(self, population, fitness, key, tournament_probabilities):
         tournament_key, winner_key = jr.split(key)
         indices = jr.choice(tournament_key, jnp.arange(self.population_size), shape=(self.tournament_size,))
-        index = jr.choice(winner_key, indices, p=1/(fitness[indices]))
+        index = jr.choice(winner_key, indices[jnp.argsort(fitness[indices])], p=tournament_probabilities)
         return population[index]
     
-    def evolve_population(self, population, fitness, key):
-        left_key, right_key, cx_key = jr.split(key, 3)
-        left_parents = jax.vmap(self.tournament_selection, in_axes=[None, None, 0])(population, fitness, jr.split(left_key, self.population_size//2))
-        right_parents = jax.vmap(self.tournament_selection, in_axes=[None, None, 0])(population, fitness, jr.split(right_key, self.population_size//2))
-        left_children, right_children = jax.vmap(self.crossover_trees)(left_parents, right_parents, jr.split(cx_key, (self.population_size//2, jnp.sum(self.layer_sizes).item())))
-        return jnp.concatenate([left_children, right_children], axis=0)
-
+    def check_restart_population(self, key, best_fitness, restart_iter_threshold, last_restart):
+        new_population = self.sample_population(key)
+        restart = (last_restart > restart_iter_threshold) & (best_fitness[self.current_generation] >= best_fitness[self.current_generation - restart_iter_threshold])
+        last_restart = jax.lax.select(restart, 0., last_restart + 1)
+        return restart, last_restart, new_population
+    
+    def evolve_population(self, population, fitness, key, reproduction_type_probabilities, reproduction_probability, tournament_probabilities):
+        left_key, right_key, repro_key, cx_key = jr.split(key, 4)
+        # restart, last_restart, restart_population = self.check_restart_population(restart_key, best_fitness, restart_iter_threshold, last_restart)
+        left_parents = jax.vmap(self.tournament_selection, in_axes=[None, None, 0, None])(population, fitness, jr.split(left_key, self.population_size//2), tournament_probabilities)
+        right_parents = jax.vmap(self.tournament_selection, in_axes=[None, None, 0, None])(population, fitness, jr.split(right_key, self.population_size//2), tournament_probabilities)
+        reproduction_type = jr.choice(repro_key, jnp.arange(3), shape=(self.population_size//2,), p=reproduction_type_probabilities)
+        left_children, right_children = jax.vmap(self.evolve_trees, in_axes=[0, 0, 0, 0, None])(left_parents, right_parents, jr.split(cx_key, (self.population_size//2, self.num_trees, 2)), reproduction_type, reproduction_probability)
+        # evolved_population = jax.lax.select(restart, restart_population, jnp.concatenate([left_children, right_children], axis=0))
+        evolved_population = jnp.concatenate([left_children, right_children], axis=0)
+        return evolved_population
+    
+    def migrate_population(self, receiver, sender, receiver_fitness, sender_fitness, migration_size):
+        population_indices = jnp.arange(self.population_size)
+        sorted_receiver = receiver[jnp.argsort(receiver_fitness, descending=True)]
+        sorted_sender = sender[jnp.argsort(sender_fitness, descending=False)]
+        return jnp.where((population_indices < migration_size)[:,None,None,None], sorted_sender, sorted_receiver)
+    
     def evolve(self, populations, fitness, key):
-        new_population = jax.vmap(self.evolve_population)(populations, fitness, jr.split(key, self.num_populations))
+        populations = jax.lax.select((self.num_populations > 1) & (((self.current_generation+1)%self.migration_period) == 0), 
+                                     jax.vmap(self.migrate_population, in_axes=[0, 0, 0, 0, None])(populations, jnp.roll(populations, 1, axis=0), fitness, jnp.roll(fitness, 1, axis=0), self.migration_size), 
+                                     populations)
+        new_population = jax.vmap(self.jit_evolve_population, in_axes=[0, 0, 0, 0, 0, 0])(populations, fitness, jr.split(key, self.num_populations), self.reproduction_type_probabilities, 
+                            self.reproduction_probabilities, self.tournament_probabilities)
+        self.current_generation += 1
         return new_population

@@ -15,14 +15,14 @@ class Strategy:
             best_solutions: Best solution at each generation.
             best_fitnesses: Best fitness at each generation.
         """
-    def __init__(self, num_generations: int, population_size: int, fitness_function: Callable) -> None:
+    def __init__(self, num_generations: int, population_size: int, fitness_function: Callable, candidate_shape: Tuple) -> None:
         self.num_generations = num_generations
         self.population_size = population_size
         self.fitness_function = fitness_function
 
         self.current_generation = 0
-        self.best_solutions = []
         self.best_fitnesses = jnp.zeros(num_generations)
+        self.best_solutions = jnp.zeros((self.num_generations, *candidate_shape))
 
     def initialize_population(self, key: PRNGKey) -> list:
         """Randomly initializes the population.

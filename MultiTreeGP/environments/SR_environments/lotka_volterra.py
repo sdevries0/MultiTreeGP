@@ -8,8 +8,8 @@ class LotkaVolterra(EnvironmentBase):
         n_var = 2
         super().__init__(process_noise, obs_noise, n_var, n_obs)
 
-        # self.init_mu = jnp.array([10, 10])
-        # self.init_sd = 2
+        self.init_mu = jnp.array([10, 10])
+        self.init_sd = 2
 
         self.alpha = 1.1
         self.beta = 0.4
@@ -20,8 +20,8 @@ class LotkaVolterra(EnvironmentBase):
         self.C = jnp.eye(self.n_var)[:self.n_obs]
 
     def sample_init_states(self, batch_size, key):
-        # return self.init_mu + self.init_sd*jrandom.normal(key, shape=(batch_size,2))
-        return jrandom.uniform(key, shape = (batch_size,2), minval=5, maxval=15)
+        return self.init_mu + self.init_sd*jrandom.normal(key, shape=(batch_size,2))
+        # return jrandom.uniform(key, shape = (batch_size,2), minval=5, maxval=15)
     
     def drift(self, t, state, args):
         return jnp.array([self.alpha * state[0] - self.beta * state[0] * state[1], self.delta * state[0] * state[1] - self.gamma * state[1]])
