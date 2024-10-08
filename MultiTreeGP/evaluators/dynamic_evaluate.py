@@ -8,7 +8,7 @@ from typing import Sequence, Tuple
 import copy
 
 class Evaluator:
-    def __init__(self, env, state_size: int, dt0: float) -> None:
+    def __init__(self, env, state_size: int, dt0: float, solver=diffrax.Euler()) -> None:
         """Evaluator for dynamic symbolic policies in control tasks.
 
         Attributes:
@@ -19,10 +19,13 @@ class Evaluator:
             dt0: Step size for solve.
         """
         self.env = env
-        self.max_fitness = 1e6
+        self.max_fitness = 1e4
         self.state_size = state_size
+        self.obs_size = env.n_obs
+        self.control_size = env.n_control
         self.latent_size = env.n_var*env.n_dim
         self.dt0 = dt0
+        self.solver = solver
 
     def __call__(self, model: Tuple, data: Tuple, eval) -> float:
         """Computes the fitness of a model.
@@ -67,39 +70,17 @@ class Evaluator:
 
         state_equation = model[:self.state_size]
         readout = model[self.state_size:]
-
-        #Define state equation
-        def _drift(t, x_a, args):
-            x = x_a[:self.latent_size]
-            a = x_a[self.latent_size:]
-
-            _, y = env.f_obs(obs_noise_key, (t, x)) #Get observations from system
-            # u = readout({"y":y, "a":a, "tar":target}) #Readout control from hidden state
-            u = eval(readout, jnp.concatenate([y, a, jnp.zeros(1), target]))
-
-            dx = env.drift(t, x, u) #Apply control to system and get system change
-            # da = state_equation({"y":y, "a":a, "u":u, "tar":target}) #Compute hidden state updates
-            da = eval(state_equation, jnp.concatenate([y, a, u, target]))
-            return jnp.concatenate([dx, da])
         
-        #Define diffusion
-        def _diffusion(t, x_a, args):
-            x = x_a[:self.latent_size]
-            a = x_a[self.latent_size:]
-            # _, y = env.f_obs(obs_noise_key, (t, x))
-            # u = readout({"y":y, "a":a, "tar":target})
-            # u = a
-            return jnp.concatenate([env.diffusion(t, x, jnp.array([0])), jnp.zeros((self.state_size, self.latent_size))]) #Only the system is stochastic
-        
-        solver = diffrax.EulerHeun()
+        solver = self.solver
         dt0 = self.dt0
         saveat = diffrax.SaveAt(ts=ts)
         _x0 = jnp.concatenate([x0, jnp.zeros(self.state_size)])
 
-        brownian_motion = diffrax.UnsafeBrownianPath(shape=(self.latent_size,), key=process_noise_key, levy_area=diffrax.BrownianIncrement)
-        system = diffrax.MultiTerm(diffrax.ODETerm(_drift), diffrax.ControlTerm(_diffusion, brownian_motion))
+        brownian_motion = diffrax.UnsafeBrownianPath(shape=(self.latent_size,), key=process_noise_key, levy_area=diffrax.SpaceTimeLevyArea)
+        system = diffrax.MultiTerm(diffrax.ODETerm(self._drift), diffrax.ControlTerm(self._diffusion, brownian_motion))
+
         sol = diffrax.diffeqsolve(
-            system, solver, ts[0], ts[-1], dt0, _x0, saveat=saveat, adjoint=diffrax.DirectAdjoint(), max_steps=16**4, discrete_terminating_event=self.env.terminate_event
+            system, solver, ts[0], ts[-1], dt0, _x0, saveat=saveat, adjoint=diffrax.DirectAdjoint(), max_steps=16**4, event=diffrax.Event(self.env.cond_fn_nan), args=(env, state_equation, readout, obs_noise_key, target, eval)
         )
 
         xs = sol.ys[:,:self.latent_size]
@@ -110,6 +91,33 @@ class Evaluator:
         fitness = env.fitness_function(xs, us, target, ts)
 
         return xs, ys, us, activities, fitness
+    
+    #Define state equation
+    def _drift(self, t, x_a, args):
+        env, state_equation, readout, obs_noise_key, target, eval = args
+        x = x_a[:self.latent_size]
+        a = x_a[self.latent_size:]
+
+        _, y = env.f_obs(obs_noise_key, (t, x)) #Get observations from system
+        # u = readout({"y":y, "a":a, "tar":target}) #Readout control from hidden state
+        u = eval(readout, jnp.concatenate([jnp.zeros(self.obs_size), a, jnp.zeros(self.control_size), target]))
+
+        dx = env.drift(t, x, u) #Apply control to system and get system change
+        # da = state_equation({"y":y, "a":a, "u":u, "tar":target}) #Compute hidden state updates
+        da = eval(state_equation, jnp.concatenate([y, a, u, target]))
+
+        # print(jnp.concatenate([dx, da]).shape)
+
+        return jnp.concatenate([dx, da])
+    
+    #Define diffusion
+    def _diffusion(self, t, x_a, args):
+        env, state_equation, readout, obs_noise_key, target, eval = args
+        x = x_a[:self.latent_size]
+        a = x_a[self.latent_size:]
+        # _, y = env.f_obs(obs_noise_key, (t, x))
+
+        return jnp.concatenate([env.diffusion(t, x, jnp.array([0])), jnp.zeros((self.state_size, self.latent_size))]) #Only the system is stochastic
     
 
 class EvaluatorMT:

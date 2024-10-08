@@ -1,7 +1,6 @@
 import jax.numpy as jnp
 import sympy
 
-from MultiTreeGP.expression import OperatorNode, LeafNode
 
 def tree_to_string(tree: list) -> str:
     """Transform tree to string representation.

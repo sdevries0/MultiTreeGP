@@ -23,6 +23,9 @@ class LotkaVolterra(EnvironmentBase):
         return self.init_mu + self.init_sd*jrandom.normal(key, shape=(batch_size,2))
         # return jrandom.uniform(key, shape = (batch_size,2), minval=5, maxval=15)
     
+    def sample_init_state2(self, ys, batch_size, key):
+        return ys[jrandom.choice(key, jnp.arange(ys.shape[0]), shape=(batch_size,), replace=False)]
+    
     def drift(self, t, state, args):
         return jnp.array([self.alpha * state[0] - self.beta * state[0] * state[1], self.delta * state[0] * state[1] - self.gamma * state[1]])
 

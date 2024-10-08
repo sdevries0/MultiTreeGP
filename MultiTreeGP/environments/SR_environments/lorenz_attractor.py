@@ -8,7 +8,7 @@ class LorenzAttractor(EnvironmentBase):
         n_var = 3
         super().__init__(process_noise, obs_noise, n_var, n_obs)
 
-        self.init_mu = jnp.array([-8,7,27])
+        self.init_mu = jnp.array([1,1,1])
         self.init_sd = 1
 
         self.sigma = 10
@@ -19,8 +19,8 @@ class LorenzAttractor(EnvironmentBase):
         self.C = jnp.eye(self.n_var)[:self.n_obs]
 
     def sample_init_states(self, batch_size, key):
-        # return self.init_mu + self.init_sd*jrandom.normal(key, shape=(batch_size,3))
-        return jnp.ones((batch_size, 3))
+        return self.init_mu + self.init_sd*jrandom.normal(key, shape=(batch_size,3))
+        # return jnp.ones((batch_size, 3))
     
     def drift(self, t, state, args):
         return jnp.array([self.sigma*(state[1]-state[0]), state[0]*(self.rho-state[2])-state[1], state[0]*state[1]-self.beta*state[2]])

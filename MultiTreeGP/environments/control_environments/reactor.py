@@ -95,5 +95,7 @@ class StirredTankReactor(EnvironmentBase):
         costs = jax.vmap(lambda _state, _u: (_state-x_d).T @ self.Q @ (_state-x_d) + (_u)@self.r@(_u))(state, control)
         return jnp.sum(costs)
 
-    def terminate_event(self, state, **kwargs):
-        return jnp.any(jnp.isnan(state.y))# | (state.y[2] > 1) | (state.y[2] < 0) 
+    def cond_fn_nan(self, t, y, args, **kwargs):
+        return jnp.where(jnp.any(jnp.isinf(y) +jnp.isnan(y)), -1.0, 1.0)
+    
+    

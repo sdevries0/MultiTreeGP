@@ -16,11 +16,12 @@ class Evaluator:
         latent_size: Dimensionality of the environment.
         dt0: Step size for solve.
     """
-    def __init__(self, env, dt0: float) -> None:
+    def __init__(self, env, dt0: float, solver=diffrax.Euler()) -> None:
         self.env = env
-        self.max_fitness = 1e4
+        self.max_fitness = 1e5
         self.latent_size = env.n_var
         self.dt0 = dt0
+        self.solver = solver
 
     def __call__(self, model, data, eval) -> float:
         """Computes the fitness of a model.
@@ -63,32 +64,19 @@ class Evaluator:
         env.initialize_parameters(params, ts)
 
         policy = model
-
-        #Define state equation
-        def _drift(t, x, args):
-            _, y = env.f_obs(obs_noise_key, (t, x)) #Get observations from system
-            # u = policy({"y":y, "tar":target}) #Readout control from hidden state
-            u = eval(policy, jnp.concatenate([y, target]))
-
-
-            dx = env.drift(t, x, u) #Apply control to system and get system change
-            return dx
         
-        #Define diffusion
-        def _diffusion(t, x, args):
-            _, y = env.f_obs(obs_noise_key, (t, x))
-            # u = policy({"y":y, "tar":target})
-            # u = a
-            return env.diffusion(t, x, jnp.array([0]))
-        
-        solver = diffrax.EulerHeun()
+        solver = self.solver
         dt0 = self.dt0
         saveat = diffrax.SaveAt(ts=ts)
 
-        brownian_motion = diffrax.UnsafeBrownianPath(shape=(self.latent_size,), key=process_noise_key, levy_area=diffrax.BrownianIncrement)
-        system = diffrax.MultiTerm(diffrax.ODETerm(_drift), diffrax.ControlTerm(_diffusion, brownian_motion))
+        brownian_motion = diffrax.UnsafeBrownianPath(shape=(self.latent_size,), key=process_noise_key, levy_area=diffrax.SpaceTimeLevyArea)
+        # brownian_motion = diffrax.VirtualBrownianTree(t0=ts[0], t1=ts[-1], tol=1e-3, shape=(self.latent_size,), key=process_noise_key, levy_area=diffrax.SpaceTimeLevyArea)
+
+        system = diffrax.MultiTerm(diffrax.ODETerm(self._drift), diffrax.ControlTerm(self._diffusion, brownian_motion))
+
         sol = diffrax.diffeqsolve(
-            system, solver, ts[0], ts[-1], dt0, x0, saveat=saveat, adjoint=diffrax.DirectAdjoint(), max_steps=16**5, discrete_terminating_event=self.env.terminate_event
+            system, solver, ts[0], ts[-1], dt0, x0, saveat=saveat, adjoint=diffrax.DirectAdjoint(), max_steps=16**5, 
+            event=diffrax.Event(self.env.cond_fn_nan), args=(env, policy, obs_noise_key, target, eval)
         )
 
         xs = sol.ys
@@ -98,3 +86,21 @@ class Evaluator:
         fitness = env.fitness_function(xs, us, target, ts)
 
         return xs, ys, us, fitness
+    
+    #Define state equation
+    def _drift(self, t, x, args):
+        env, policy, obs_noise_key, target, eval = args
+        _, y = env.f_obs(obs_noise_key, (t, x)) #Get observations from system
+        # u = policy({"y":y, "tar":target}) #Readout control from hidden state
+        u = eval(policy, jnp.concatenate([y, target]))
+
+        dx = env.drift(t, x, u) #Apply control to system and get system change
+        return dx
+    
+    #Define diffusion
+    def _diffusion(self, t, x, args):
+        env, policy, obs_noise_key, target, eval = args
+        # _, y = self.env.f_obs(obs_noise_key, (t, x))
+        # u = policy({"y":y, "tar":target})
+        # u = a
+        return env.diffusion(t, x, jnp.array([0]))

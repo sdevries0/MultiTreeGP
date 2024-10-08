@@ -22,7 +22,7 @@ class Strategy:
 
         self.current_generation = 0
         self.best_fitnesses = jnp.zeros(num_generations)
-        self.best_solutions = jnp.zeros((self.num_generations, *candidate_shape))
+        self.best_solutions = jnp.zeros((num_generations, *candidate_shape))
 
     def initialize_population(self, key: PRNGKey) -> list:
         """Randomly initializes the population.

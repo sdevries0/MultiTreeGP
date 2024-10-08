@@ -1,224 +1,41 @@
 import jax
 from jax import Array
 import jax.numpy as jnp
-import jax.random as jrandom
+import jax.random as jr
 from jax.random import PRNGKey
-import equinox as eqx
 
-import MultiTreeGP.genetic_operators.mutation as mutation
-import MultiTreeGP.genetic_operators.crossover as crossover
-import MultiTreeGP.genetic_operators.initialization as initialization
-import MultiTreeGP.genetic_operators.simplification as simplification
-from MultiTreeGP.networks.tree_policy import TreePolicy
+def evolve_trees(parent1, parent2, keys, type, reproduction_probability, reproduction_functions):
+    child1, child2, mutate_functions = jax.lax.switch(type, reproduction_functions, parent1, parent2, keys, reproduction_probability)
 
+    return child1, child2, mutate_functions
 
-def tree_depth_and_size(offspring: TreePolicy) -> int:
-    """Returns highest depth of tree.
+def tournament_selection(population, fitness, key, tournament_probabilities, tournament_size, population_indices):
+    tournament_key, winner_key = jr.split(key)
+    indices = jr.choice(tournament_key, population_indices, shape=(tournament_size,))
+    index = jr.choice(winner_key, indices[jnp.argsort(fitness[indices])], p=tournament_probabilities)
+    return population[index]
 
-    :param tree: Tree policy.
-    :returns: Highest depth of the nodes in the tree.
-    """
-    max_depth = max_size = 0
-    for layer in offspring():
-        for tree in layer:
-            flat_tree = jax.tree_util.tree_leaves_with_path(tree)
-            max_depth = max(max_depth, jnp.max(jnp.array([len(node[0]) for node in flat_tree])))
-            max_size = max(max_size, len(flat_tree))
+def evolve_population(population, fitness, key, reproduction_type_probabilities, reproduction_probability, tournament_probabilities, population_indices, population_size, tournament_size, num_trees, elite_size, reproduction_functions):
+    left_key, right_key, repro_key, cx_key = jr.split(key, 4)
+    elite = population[jnp.argsort(fitness)[:elite_size]]
+    left_parents = jax.vmap(tournament_selection, in_axes=[None, None, 0, None, None, None])(population, fitness, jr.split(left_key, (population_size - elite_size)//2), tournament_probabilities, tournament_size, population_indices)
+    right_parents = jax.vmap(tournament_selection, in_axes=[None, None, 0, None, None, None])(population, fitness, jr.split(right_key, (population_size - elite_size)//2), tournament_probabilities, tournament_size, population_indices)
+    reproduction_type = jr.choice(repro_key, jnp.arange(3), shape=((population_size - elite_size)//2,), p=reproduction_type_probabilities)
+    left_children, right_children, mutate_functions = jax.vmap(evolve_trees, in_axes=[0, 0, 0, 0, None, None])(left_parents, right_parents, jr.split(cx_key, ((population_size - elite_size)//2, num_trees, 2)), reproduction_type, reproduction_probability, reproduction_functions)
+    evolved_population = jnp.concatenate([elite, left_children, right_children], axis=0)
+    return evolved_population, left_parents, right_parents, left_children, right_children, reproduction_type, mutate_functions
 
-    return max_depth, max_size
+def migrate_population(receiver, sender, receiver_fitness, sender_fitness, migration_size, population_indices):
+    sorted_receiver = receiver[jnp.argsort(receiver_fitness, descending=True)]
+    sorted_sender = sender[jnp.argsort(sender_fitness, descending=False)]
+    return jnp.where((population_indices < migration_size)[:,None,None,None], sorted_sender, sorted_receiver)
 
-def tournament_selection(population: list, key: PRNGKey, tournament_probabilities: Array, tournament_size: int) -> TreePolicy:
-    """Selects a candidate from a randomly selected tournament. Selection is based on fitness and the probability of being chosen given a rank.
-
-    :param population: Population of tree policies.
-    :param key: Random key.
-    :param tournament_probabilities: Probability to be selected of each rank in the tournament.
-    :param tournament_size: Size of the tournament.
-    :returns: Tree policy that wins the tournament.
-    """
-    key1, key2 = jrandom.split(key)
-
-    tournament = []
-    #Sample solutions to include in the tournament
-    tournament_indices = jrandom.choice(key1, len(population), shape=(tournament_size,), replace=False)
-    for i in tournament_indices:
-        tournament.append(population[i])
-    #Sort on fitness
-    tournament.sort(key=lambda x: x.fitness)
-    #Sample tournament winner
-    index = jrandom.choice(key2, tournament_size, p=tournament_probabilities)
-    return tournament[index]
-
-def invalid_trees(parent: TreePolicy, child: TreePolicy, layer_sizes: Array, expressions: list, max_depth: int, max_nodes: int) -> bool:
-    """If the child is equal to its parent or violates a condition, do not accept it in the new population.
-
-    :param parent: Parent tree policy.
-    :param child: Child tree policy
-    :param layer_sizes: Size of each layer in a tree policy.
-    :param expressions: Expressions for each layer in a tree policy.
-    :returns: Boolean indicating whether the child should be accepted in the new population.
-    """
-    depth, size = tree_depth_and_size(child)
-    if depth > max_depth or size > max_nodes:
-        return True
-
-    equals = True
-
-    for i in range(len(layer_sizes)):
-        for tree in range(layer_sizes[i]):
-            if not expressions[i].condition(child()[i][tree]):
-                return True
-            if parent()[i][tree] != child()[i][tree]:
-                equals = False
-    return equals
-
-def next_population(population: list, 
-                    key: PRNGKey, 
-                    expressions: list, 
-                    layer_sizes: Array, 
-                    reproduction_type_probabilities: Array, 
-                    reproduction_probability: float, 
-                    mutation_probabilities: dict, 
-                    tournament_probabilities: Array, 
-                    tournament_size: int, 
-                    max_depth: int, 
-                    max_init_depth: int, 
-                    max_nodes: int,
-                    elite_percentage: float,
-                    leaf_sd: float
-                ) -> list:
-    """Generates a new population by evolving the current population. After cross-over and mutation, the new trees are checked to be different from their parents.
-
-    :param population: Population of tree policies.
-    :param key: Random key.
-    :param expressions: Expressions for each layer in a tree policy.
-    :param layer_sizes: Size of each layer in a tree policy.
-    :param reproduction_type_probabilities: Probabilities for each of reproduction types. 
-    :param reproduction_probability: Probability of a tree to be adapted in a tree policy.
-    :param mutation_probabilities: Probabilities of the mutation functions.
-    :param tournament_probabilities: Probability to be selected of each rank in the tournament.
-    :param tournament_size: Size of the tournament.
-    :param max_depth: Highest depth of a tree.
-    :param max_init_depth: Highest depth of a tree at initialization.
-    :param elite_percentage: Percentage of population that is the elite.
-    :param leaf_sd: Standard deviation for sampling constants.
-    :returns: New population of tree policies.
-    """
-    population_size = len(population)
-    population.sort(key=lambda x: x.fitness)
-    new_pop = []
-    #Keep elite candidates in population
-    elite_size = int(population_size*elite_percentage)
-    for i in range(elite_size):
-        new_pop.append(population[i])
-    remaining_candidates = population_size - elite_size
-    failed_mutations = 0
-
-    while remaining_candidates>0: #Loop until new population has reached the desired size
-        probs = reproduction_type_probabilities.copy()
-        key, new_key1 = jrandom.split(key, 2)
-        #Select parent
-        parent = tournament_selection(population, new_key1, tournament_probabilities, tournament_size)
-
-        if remaining_candidates==1:
-            probs = probs.at[0].set(0)
-
-        key, new_key = jrandom.split(key)
-        reproduction_type = jrandom.choice(new_key, jnp.arange(4), p=jnp.array(probs))
-
-        if reproduction_type==0: #Cross-over
-            key, new_key1, new_key2, new_key3 = jrandom.split(key, 4)
-            #Select second parent
-            partner = tournament_selection(population, new_key1, tournament_probabilities, tournament_size)
-
-            #Sample a cross-over method
-            cross_over_type = jrandom.choice(new_key2, jnp.arange(3), p=jnp.array([0.0 if jnp.sum(layer_sizes) > 1 else 0,0.0,0.4]))    
-            if cross_over_type == 0:
-                offspring = crossover.tree_cross_over(parent, partner, reproduction_probability, layer_sizes, new_key3)
-            elif cross_over_type == 1:
-                offspring = crossover.uniform_cross_over(parent, partner, reproduction_probability, layer_sizes, new_key3)
-            else:
-                offspring = crossover.standard_cross_over(parent, partner, reproduction_probability, layer_sizes, new_key3, expressions)
-
-            #If a tree policy remain the same or one of the trees exceeds the max depth, cross-over has failed
-            if invalid_trees(parent, offspring[0], layer_sizes, expressions, max_depth, max_nodes):
-                failed_mutations += 1
-            else:
-                #Append new tree policy to the new population
-                key, new_key1, new_key2 = jrandom.split(key, 3)
-                child1 = offspring[0]
-                child1.reset_fitness()
-                if jrandom.uniform(new_key1)<0.1:
-                    for i in range(layer_sizes.shape[0]):
-                        for j in range(layer_sizes[i]):
-                            simplified_tree = simplification.simplify_tree(child1()[i][j])
-                            if simplified_tree:
-                                child1 = eqx.tree_at(lambda t: t()[i][j], child1, simplified_tree)
-                new_pop.append(child1)
-                remaining_candidates -= 1
-
-                # print(f"Crossover type {cross_over_type}, parent: {parent}, child: {offspring[0]}")
-
-            #If a tree policy remain the same or one of the trees exceeds the max depth, cross-over has failed
-            if invalid_trees(partner, offspring[1], layer_sizes, expressions, max_depth, max_nodes):
-                failed_mutations += 1
-            else:
-                #Append new tree policy to the new population
-                child2 = offspring[1]
-                child2.reset_fitness()
-                if jrandom.uniform(new_key2)<0.1:
-                    for i in range(layer_sizes.shape[0]):
-                        for j in range(layer_sizes[i]):
-                            simplified_tree = simplification.simplify_tree(child2()[i][j])
-                            if simplified_tree:
-                                child2 = eqx.tree_at(lambda t: t()[i][j], child2, simplified_tree)
-                new_pop.append(child2)
-                remaining_candidates -= 1
-
-                # print(f"Crossover type {cross_over_type}, parent: {partner}, child: {offspring[1]}")
-
-        elif reproduction_type==1: #Mutation
-            key, new_key1, new_key2 = jrandom.split(key, 3)
-            child = mutation.mutate_trees(parent, layer_sizes, new_key1, reproduction_probability, mutation_probabilities, 
-                                    expressions, max_init_depth, leaf_sd)
-            
-            #If a tree policy remain the same or one of the trees exceeds the max depth, mutation has failed
-            if invalid_trees(parent, child, layer_sizes, expressions, max_depth, max_nodes):
-                failed_mutations += 1
-            else:
-                #Append new tree policy to the new population
-                child.reset_fitness()
-                if jrandom.uniform(new_key2)<0.1:
-                    for i in range(layer_sizes.shape[0]):
-                        for j in range(layer_sizes[i]):
-                            simplified_tree = simplification.simplify_tree(child()[i][j])
-                            if simplified_tree:
-                                child = eqx.tree_at(lambda t: t()[i][j], child, simplified_tree)
-                new_pop.append(child)
-                remaining_candidates -= 1
-                # print(f"Mutation, parent: {parent}, child: {child}")
-
-        elif reproduction_type==2: #Sample new tree policy
-            key, new_key = jrandom.split(key)
-            new_trees = initialization.sample_trees(new_key, expressions, layer_sizes, max_depth = max_init_depth, max_size = max_nodes, N = 1, 
-                                                    init_method = "ramped", leaf_sd = leaf_sd)
-            #Add new tree policy to the new population
-            remaining_candidates -= 1
-            new_pop.append(new_trees)
-
-        elif reproduction_type==3: #Simplification of a tree policy
-            child = parent
-            simplified = False
-            for i in range(layer_sizes.shape[0]):
-                for j in range(layer_sizes[i]):
-                    simplified_tree = simplification.simplify_tree(parent()[i][j])
-                    if simplified_tree:
-                        child = eqx.tree_at(lambda t: t()[i][j], child, simplified_tree)
-                        simplified = True
-            #If at least one tree is simplified, add simplified tree policy to new population
-            if simplified:
-                remaining_candidates -= 1
-                new_pop.append(child)
-            else:
-                failed_mutations += 1
-    return new_pop
+def evolve_populations(jit_evolve_population, populations, fitness, key, current_generation, migration_period, migration_size, reproduction_type_probabilities, reproduction_probabilities, tournament_probabilities):
+    num_populations, population_size, num_trees, _, _ = populations.shape
+    population_indices = jnp.arange(population_size)
+    populations = jax.lax.select((num_populations > 1) & (((current_generation+1)%migration_period) == 0), 
+                                    jax.vmap(migrate_population, in_axes=[0, 0, 0, 0, None, None])(populations, jnp.roll(populations, 1, axis=0), fitness, jnp.roll(fitness, 1, axis=0), migration_size, population_indices), 
+                                    populations)
+    new_population, left_parents, right_parents, left_children, right_children, reproduction_type, mutate_functions = jax.vmap(jit_evolve_population, in_axes=[0, 0, 0, 0, 0, 0, None])(populations, fitness, jr.split(key, num_populations), reproduction_type_probabilities, 
+                        reproduction_probabilities, tournament_probabilities, population_indices)
+    return new_population, left_parents, right_parents, left_children, right_children, reproduction_type, mutate_functions
