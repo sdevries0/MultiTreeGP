@@ -7,12 +7,16 @@ import optimistix as optx
 from jax.random import PRNGKey
 
 class Evaluator:
-    """Evaluator for symbolic expressions on symbolic regression tasks.
+    """Evaluator for candidates on symbolic regression tasks
 
     Attributes:
-        max_fitness: Max fitness which is assigned when a trajectory returns an invalid value.
-        dt0: Step size for solve.
+        max_fitness: Max fitness which is assigned when a trajectory returns an invalid value
+        dt0: Initial step size for integration
         fitness_function: Function that computes the fitness of a candidate
+        system: ODE term of the drift function
+        solver: Solver used for integration
+        stepsize_controller: Controller for the stepsize during integration
+        max_steps: The maximum number of steps that can be used in integration
     """
     def __init__(self, solver: diffrax.AbstractSolver = diffrax.Euler(), dt0: float = 0.01, max_steps: int = 16**4, stepsize_controller: diffrax.AbstractStepSizeController = diffrax.ConstantStepSize()) -> None:
         self.max_fitness = 1e5
@@ -24,7 +28,6 @@ class Evaluator:
         self.max_steps = max_steps
 
     def __call__(self, coefficients: Array, nodes: Array, data: Tuple, tree_evaluator: Callable) -> float:
-        
         """Evaluates the candidate on a task
 
         :param coefficients: The coefficients of the candidate
@@ -32,7 +35,7 @@ class Evaluator:
         :param data: The data required to evaluate the candidate
         :param tree_evaluator: Function for evaluating trees
 
-        Returns: Fitness of the model
+        Returns: Fitness of the candidate
         """
         fitness, _ = self.evaluate_candidate(jnp.concatenate([nodes, coefficients], axis=-1), data, tree_evaluator)
 

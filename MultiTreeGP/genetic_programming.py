@@ -69,7 +69,7 @@ class GeneticProgramming:
                  max_nodes: int = 30,
                  device_type: str = 'cpu',
                  tournament_size: int = 7, 
-                 size_parsinomy: float = 1.0, 
+                 size_parsinomy: float = 0.0, 
                  coefficient_sd: float = 1.0,
                  migration_period: int = 10,
                  migration_percentage: float = 0.1,

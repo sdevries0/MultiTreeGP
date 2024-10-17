@@ -4,19 +4,24 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import diffrax
 
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Callable
 import copy
 
 class Evaluator:
-    def __init__(self, env, state_size: int, dt0: float, solver=diffrax.Euler()) -> None:
-        """Evaluator for dynamic symbolic policies in control tasks.
+    def __init__(self, env, state_size: int, dt0: float, solver=diffrax.Euler(), max_steps: int = 16**4, stepsize_controller: diffrax.AbstractStepSizeController = diffrax.ConstantStepSize()) -> None:
+        """Evaluator for dynamic symbolic policies in control tasks
 
         Attributes:
-            env: Environment on which the model is evaluated.
-            max_fitness: Max fitness which is assigned when a trajectory returns an invalid value.
-            state_size: Dimensionality of the hidden state.
-            latent_size: Dimensionality of the environment.
-            dt0: Step size for solve.
+            env: Environment on which the candidate is evaluated
+            max_fitness: Max fitness which is assigned when a trajectory returns an invalid value
+            state_size: Dimensionality of the hidden state
+            obs_size: Dimensionality of the observations
+            control_size: Dimensionality of the control
+            latent_size: Dimensionality of the state of the environment
+            dt0: Initial step size for integration
+            solver: Solver used for integration
+            max_steps: The maximum number of steps that can be used in integration
+            stepsize_controller: Controller for the stepsize during integration
         """
         self.env = env
         self.max_fitness = 1e4
@@ -26,96 +31,96 @@ class Evaluator:
         self.latent_size = env.n_var*env.n_dim
         self.dt0 = dt0
         self.solver = solver
+        self.max_steps = max_steps
+        self.stepsize_controller = stepsize_controller
 
-    def __call__(self, model: Tuple, data: Tuple, eval) -> float:
-        """Computes the fitness of a model.
+    def __call__(self, coefficients: Array, nodes: Array, data: Tuple, tree_evaluator: Callable) -> float:
+        """Evaluates the candidate on a task
 
-        :param model: Model with trees for the hidden state and readout.
-        :param data: The data required to evaluate the controller.
+        :param coefficients: The coefficients of the candidate
+        :param nodes: The nodes and index references of the candidate
+        :param data: The data required to evaluate the candidate
+        :param tree_evaluator: Function for evaluating trees
 
-        Returns: The fitness of the model.
+        Returns: Fitness of the candidate
         """
-        _, _, _, _, fitness = self.evaluate_model(model, data, eval)
+        _, _, _, _, fitness = self.evaluate_candidate(jnp.concatenate([nodes, coefficients], axis=-1), data, tree_evaluator)
 
         nan_or_inf =  jax.vmap(lambda f: jnp.isinf(f) + jnp.isnan(f))(fitness)
         fitness = jnp.where(nan_or_inf, jnp.ones(fitness.shape)*self.max_fitness, fitness)
         fitness = jnp.mean(fitness)
         return jnp.clip(fitness,0,self.max_fitness)
     
-    def evaluate_model(self, model: Tuple, data: Tuple, eval) -> Tuple[Array, Array, Array, Array, float]:
-        """Evaluate a tree by simulating the environment and controller as a coupled system.
+    def evaluate_candidate(self, candidate: Array, data: Tuple, tree_evaluator: Callable) -> Tuple[Array, Array, Array, Array, float]:
+        """Evaluates a candidate given a task and data
 
-        :param model: Model with trees for the hidden state and readout.
-        :param data: The data required to evaluate the controller.
-
-        Returns: States, observations, control, activities of the hidden state of the model and the fitness of the model.
+        :param candidate: Candidate that is evaluated
+        :param data: The data required to evaluate the candidate
+        :param tree_evaluator: Function for evaluating trees
+        
+        Returns: Predictions and fitness of the candidate
         """
-        return jax.vmap(self.evaluate_control_loop, in_axes=[None, 0, None, 0, 0, 0, 0, None])(model, *data, eval)
+        return jax.vmap(self.evaluate_control_loop, in_axes=[None, 0, None, 0, 0, 0, 0, None])(candidate, *data, tree_evaluator)
     
-    def evaluate_control_loop(self, model: Tuple, x0: Array, ts: Array, target: float, process_noise_key: jrandom.PRNGKey, obs_noise_key: jrandom.PRNGKey, params: Tuple, eval) -> Tuple[Array, Array, Array, Array, float]:
+    def evaluate_control_loop(self, candidate: Array, x0: Array, ts: Array, target: float, process_noise_key: jrandom.PRNGKey, obs_noise_key: jrandom.PRNGKey, params: Tuple, tree_evaluator: Callable) -> Tuple[Array, Array, Array, Array, float]:
         """Solves the coupled differential equation of the system and controller. The differential equation of the system is defined in the environment and the differential equation 
         of the control is defined by the set of trees
 
-        :param model: Model with trees for the hidden state and readout
+        :param candidate: Candidate with trees for the hidden state and readout
         :param x0: Initial state of the system
         :param ts: time points on which the controller is evaluated
         :param target: Target position that the system should reach
-        :param key: Random key.
-        :param params: Parameters that define the environment.
+        :param process_noise_key: Key to generate process noise
+        :param obs_noise_key: Key to generate noisy observations
+        :param params: Parameters that define the environment
+        :param tree_evaluator: Function for evaluating trees
 
-        Returns: States, observations, control, activities of the hidden state of the model and the fitness of the model.
+        Returns: States, observations, control, activities of the hidden state of the candidate and the fitness of the candidate.
         """
         env = copy.copy(self.env)
         env.initialize_parameters(params, ts)
 
-        state_equation = model[:self.state_size]
-        readout = model[self.state_size:]
+        state_equation = candidate[:self.state_size]
+        readout = candidate[self.state_size:]
         
         solver = self.solver
         dt0 = self.dt0
         saveat = diffrax.SaveAt(ts=ts)
         _x0 = jnp.concatenate([x0, jnp.zeros(self.state_size)])
 
-        brownian_motion = diffrax.UnsafeBrownianPath(shape=(self.latent_size,), key=process_noise_key, levy_area=diffrax.SpaceTimeLevyArea)
-        system = diffrax.MultiTerm(diffrax.ODETerm(self._drift), diffrax.ControlTerm(self._diffusion, brownian_motion))
+        system = diffrax.ODETerm(self._drift)
 
         sol = diffrax.diffeqsolve(
-            system, solver, ts[0], ts[-1], dt0, _x0, saveat=saveat, adjoint=diffrax.DirectAdjoint(), max_steps=16**4, event=diffrax.Event(self.env.cond_fn_nan), args=(env, state_equation, readout, obs_noise_key, target, eval)
+            system, solver, ts[0], ts[-1], dt0, _x0, saveat=saveat, adjoint=diffrax.DirectAdjoint(), max_steps=self.max_steps, event=diffrax.Event(self.env.cond_fn_nan), 
+            args=(env, state_equation, readout, obs_noise_key, target, tree_evaluator), stepsize_controller=self.stepsize_controller, throw=False
         )
 
         xs = sol.ys[:,:self.latent_size]
         _, ys = jax.lax.scan(env.f_obs, obs_noise_key, (ts, xs))
         activities = sol.ys[:,self.latent_size:]
-        us = jax.vmap(lambda y, a, tar: eval(readout, jnp.concatenate([y, a, jnp.zeros(1), target])), in_axes=[0,0,None])(ys, activities, target)
+        us = jax.vmap(lambda y, a, tar: tree_evaluator(readout, jnp.concatenate([y, a, jnp.zeros(self.control_size), target])), in_axes=[0,0,None])(ys, activities, target)
 
         fitness = env.fitness_function(xs, us, target, ts)
 
         return xs, ys, us, activities, fitness
     
-    #Define state equation
     def _drift(self, t, x_a, args):
-        env, state_equation, readout, obs_noise_key, target, eval = args
+        env, state_equation, readout, obs_noise_key, target, tree_evaluator = args
         x = x_a[:self.latent_size]
         a = x_a[self.latent_size:]
 
         _, y = env.f_obs(obs_noise_key, (t, x)) #Get observations from system
-        # u = readout({"y":y, "a":a, "tar":target}) #Readout control from hidden state
-        u = eval(readout, jnp.concatenate([jnp.zeros(self.obs_size), a, jnp.zeros(self.control_size), target]))
+        u = tree_evaluator(readout, jnp.concatenate([jnp.zeros(self.obs_size), a, jnp.zeros(self.control_size), target]))
 
         dx = env.drift(t, x, u) #Apply control to system and get system change
-        # da = state_equation({"y":y, "a":a, "u":u, "tar":target}) #Compute hidden state updates
-        da = eval(state_equation, jnp.concatenate([y, a, u, target]))
-
-        # print(jnp.concatenate([dx, da]).shape)
+        da = tree_evaluator(state_equation, jnp.concatenate([y, a, u, target]))
 
         return jnp.concatenate([dx, da])
     
-    #Define diffusion
     def _diffusion(self, t, x_a, args):
-        env, state_equation, readout, obs_noise_key, target, eval = args
+        env, state_equation, readout, obs_noise_key, target, tree_evaluator = args
         x = x_a[:self.latent_size]
         a = x_a[self.latent_size:]
-        # _, y = env.f_obs(obs_noise_key, (t, x))
 
         return jnp.concatenate([env.diffusion(t, x, jnp.array([0])), jnp.zeros((self.state_size, self.latent_size))]) #Only the system is stochastic
     
@@ -128,23 +133,23 @@ class EvaluatorMT:
         self.latent_size = env.n_var*env.n_dim
         self.dt0 = dt0
 
-    def __call__(self, model, data) -> float:
-        _, _, _, _, fitness = self.evaluate_model(model, data)
+    def __call__(self, candidate, data) -> float:
+        _, _, _, _, fitness = self.evaluate_candidate(candidate, data)
 
         nan_or_inf =  jax.vmap(lambda f: jnp.isinf(f) + jnp.isnan(f))(fitness)
         fitness = jnp.where(nan_or_inf, jnp.ones(fitness.shape)*self.max_fitness, fitness)
         fitness = jnp.mean(fitness)
         return jnp.clip(fitness,0,self.max_fitness)
     
-    def evaluate_model(self, model, data):
+    def evaluate_candidate(self, candidate, data):
         "Evaluate a tree by simulating the environment and controller as a coupled system"
-        return jax.vmap(self.evaluate_control_loop, in_axes=[None, 0, None, 0, 0, 0, 0])(model, *data)
+        return jax.vmap(self.evaluate_control_loop, in_axes=[None, 0, None, 0, 0, 0, 0])(candidate, *data)
     
-    def evaluate_control_loop(self, model: Tuple, x0: Sequence[float], ts: Sequence[float], target: float, process_noise_key: jrandom.PRNGKey, obs_noise_key: jrandom.PRNGKey, params: Tuple):
+    def evaluate_control_loop(self, candidate: Tuple, x0: Sequence[float], ts: Sequence[float], target: float, process_noise_key: jrandom.PRNGKey, obs_noise_key: jrandom.PRNGKey, params: Tuple):
         """Solves the coupled differential equation of the system and controller. The differential equation of the system is defined in the environment and the differential equation 
         of the control is defined by the set of trees
         Inputs:
-            model (NetworkTrees): Model with trees for the hidden state and readout
+            candidate (NetworkTrees): Candidate with trees for the hidden state and readout
             x0 (float): Initial state of the system
             ts (Array[float]): time points on which the controller is evaluated
             target (float): Target position that the system should reach
@@ -154,14 +159,14 @@ class EvaluatorMT:
         Returns:
             xs (Array[float]): States of the system at every time point
             ys (Array[float]): Observations of the system at every time point
-            us (Array[float]): Control of the model at every time point
-            activities (Array[float]): Activities of the hidden state of the model at every time point
-            fitness (float): Fitness of the model 
+            us (Array[float]): Control of the candidate at every time point
+            activities (Array[float]): Activities of the hidden state of the candidate at every time point
+            fitness (float): Fitness of the candidate 
         """
         env = copy.copy(self.env)
         env.initialize_parameters(params, ts)
 
-        state_equation, readout = model
+        state_equation, readout = candidate
 
         #Define state equation
         def _drift(t, x_a, args):
