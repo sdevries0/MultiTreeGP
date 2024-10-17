@@ -82,9 +82,9 @@ class Acrobot(EnvironmentBase):
         costs = jnp.where((ts/(ts[1]-ts[0]))>first_success, jnp.zeros_like(control_cost), control_cost)
 
         return first_success + (first_success == 0) * ts.shape[0] + jnp.sum(costs)
-
-    def terminate_event(self, state, **kwargs):
-        return (jnp.abs(state.y[2])>(8*jnp.pi)) | (jnp.abs(state.y[3])>(18*jnp.pi)) | jnp.any(jnp.isnan(state.y)) | jnp.any(jnp.isinf(state.y))
+    
+    def cond_fn_nan(self, t, y, args, **kwargs):
+        return jnp.where((jnp.abs(y[2])>(8*jnp.pi)) | (jnp.abs(y[3])>(18*jnp.pi)) | jnp.any(jnp.isnan(y)) | jnp.any(jnp.isinf(y)), -1.0, 1.0)
 
 class Acrobot2(EnvironmentBase):
     def __init__(self, process_noise, obs_noise, n_obs = None):

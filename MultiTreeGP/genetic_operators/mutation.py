@@ -1,277 +1,579 @@
 import jax
 import jax.numpy as jnp
-import jax.random as jrandom
+import jax.random as jr
+from functools import partial
+from typing import Tuple, Callable
 from jax import Array
 from jax.random import PRNGKey
-import equinox as eqx
 
-from MultiTreeGP.expression import Expression
-import MultiTreeGP.genetic_operators.initialization as initialization
-from MultiTreeGP.networks.tree_policy import TreePolicy
-
-def key_loc(tree: list, path: list) -> list:
-    """Finds subtree at location specified by a path.
-
-    :tree: Tree.
-    :path: Path to node in the tree.
-    :returns: Subtree.
+def find_end_idx(carry: Tuple[Array, int, int]) -> Tuple[Array, int, int]:
     """
-    new_tree = tree
-    for k in path:
-        new_tree = new_tree[k.idx]
-    return new_tree
+    Finds the index of the last node in a subtree
 
-def insert_operator(expressions: Expression, tree: list, key: PRNGKey, leaf_sd: float) -> list:
-    """Insert an operator at a random point in tree. Sample a new leaf if necessary to satisfy arity of the operator.
+    :param tree
+    :param open_slots: The number of open slots in the tree that need to be matched with a node
+    :param counter: The index of the current node
 
-    :expressions: Expressions for each layer in a tree policy.
-    :tree: Tree of operators and leaves.
-    :key: Random key.
-    :leaf_sd: Standard deviation for sampling constants.
-    :returns: Mutated tree.
+    Returns: The index of the last node in the subtree
     """
-    nodes = jax.tree_util.tree_leaves(tree)
-    flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
-    operator_indices = jnp.ravel(jnp.argwhere(jnp.array([node in expressions.operators for node in nodes])))
 
-    key, new_key = jrandom.split(key)
-    index = jrandom.choice(new_key, operator_indices)
-    path = flat_tree_and_path[index][0][:-1]
-    subtree = key_loc(tree, path)
+    tree, open_slots, counter = carry
+    _, idx1, idx2, _ = tree[counter]
+    open_slots -= 1 #Reduce open slot for current node
+    open_slots = jax.lax.select(idx1 < 0, open_slots, open_slots+1) #Increase the open slots for a child
+    open_slots = jax.lax.select(idx2 < 0, open_slots, open_slots+1) #Increase the open slots for a child
+    counter -= 1
+    return (tree, open_slots, counter)
+
+def sample_indices(carry: Tuple[PRNGKey, Array, float]) -> Tuple[PRNGKey, Array, float]:
+    """
+    Samples indices of the trees in a candidate that will be mutated
     
-    new_key1, new_key2, new_key3 = jrandom.split(key, 3)
-    new_operator = expressions.operators[jrandom.choice(new_key1, a = jnp.arange(len(expressions.operators)), shape=(), p = expressions.operators_prob)]
+    :param key
+    :param indices: Indices of trees
+    :param reproduction_probability: Probability that determines how likely a tree is mutated
 
-    if new_operator.arity == 2:
-        tree_position = jrandom.randint(new_key2, shape=(), minval=0, maxval=2)
-        other_leaf = initialization.sample_leaf(new_key3, expressions, leaf_sd)
-        new_tree = [new_operator, subtree, other_leaf] if (tree_position == 0) else [new_operator, other_leaf, subtree]
-    elif new_operator.arity == 1:
-        new_tree = [new_operator, subtree]
-        
-    return eqx.tree_at(lambda t: key_loc(t, path), tree, new_tree)
-
-def add_subtree(expressions: Expression, tree: list, key: PRNGKey, leaf_sd: float) -> list:
-    """Replace a leaf with a new subtree.
-
-    :expressions: Expressions for each layer in a tree policy.
-    :tree: Tree of operators and leaves.
-    :key: Random key.
-    :leaf_sd: Standard deviation for sampling constants.
-    :returns: Mutated tree.
+    Returns: The indices of the trees to be mutated
     """
-    nodes = jax.tree_util.tree_leaves(tree)
-    flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
-    leaf_indices = jnp.ravel(jnp.argwhere(jnp.array([node not in expressions.operators for node in nodes])))
 
-    key, new_key1, new_key2 = jrandom.split(key, 3)
-    index = jrandom.choice(new_key1, leaf_indices)
-    path = flat_tree_and_path[index][0][:-1]
-    return eqx.tree_at(lambda t: key_loc(t, path), tree, initialization.grow_node(new_key2, expressions, depth=3, leaf_sd=leaf_sd))
+    key, indices, reproduction_probability = carry
+    indices = jr.bernoulli(key, p=reproduction_probability, shape=indices.shape)*1.0
+    return (jr.split(key, 1)[0], indices, reproduction_probability)
 
-def mutate_operator(expressions: Expression, tree: list, key: PRNGKey, leaf_sd: float) -> list:
-    """Replace an operator with different operator of equal arity.
-
-    :expressions: Expressions for each layer in a tree policy.
-    :tree: Tree of operators and leaves.
-    :key: Random key.
-    :leaf_sd: Standard deviation for sampling constants.
-    :returns: Mutated tree.
+def sample_leaf_node(carry: Tuple[Array, PRNGKey, int, int, float, Array]) -> Tuple[Array, PRNGKey, int, int, float, Array]:
     """
-    nodes = jax.tree_util.tree_leaves(tree)
-    operator_indicies = jnp.ravel(jnp.argwhere(jnp.array([node in expressions.operators for node in nodes])))
-    flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
+    Samples a leaf node to be replaced in the tree and a new leaf node
+    
+    :param tree
+    :param key
+    :param variable_array: The valid variables for this tree
+    :param variable_indices: The indices of the available leaf nodes
 
-    key, new_key = jrandom.split(key)
-    index = jrandom.choice(new_key, operator_indicies)
-    symbol = flat_tree_and_path[index][1]
-    path = flat_tree_and_path[index][0]
-
-    if symbol.arity == 2:
-        bin_copy = [node for node in expressions.operators if node.arity == 2]
-        bin_copy.remove(symbol)
-        key, new_key = jrandom.split(key)
-        new_operator = bin_copy[jrandom.randint(new_key, shape=(), minval=0, maxval=len(bin_copy))]
-        new_tree = eqx.tree_at(lambda t: key_loc(t, path), tree, new_operator)
-    else:
-        un_copy = [node for node in expressions.operators if node.arity == 1]
-        un_copy.remove(symbol)
-        if len(un_copy)==0:
-            new_key, new_key2, new_key3 = jrandom.split(key, 3)
-            subtree = key_loc(tree, path[:-1])[1]
-
-            bin_copy = [node for node in expressions.operators if node.arity == 2]
-            new_operator = bin_copy[jrandom.randint(new_key, shape=(), minval=0, maxval=len(bin_copy))]
-
-            tree_position = jrandom.randint(new_key2, shape=(), minval=0, maxval=2)
-            other_leaf = initialization.sample_leaf(new_key3, expressions, sd=leaf_sd)
-            new_subtree = [new_operator, subtree, other_leaf] if (tree_position == 0) else [new_operator, other_leaf, subtree]
-            new_tree = eqx.tree_at(lambda t: key_loc(t, path[:-1]), tree, new_subtree)
-
-        else:
-            key, new_key = jrandom.split(key)
-            new_operator = un_copy[jrandom.randint(new_key, shape=(), minval=0, maxval=len(un_copy))]
-            new_tree = eqx.tree_at(lambda t: key_loc(t, path), tree, new_operator)
-
-    return eqx.tree_at(lambda t: t, tree, new_tree)
-
-def prepend_operator(expressions: Expression, tree: list, key: PRNGKey, leaf_sd: float) -> list:
-    """Add an operator to the top of the tree.
-
-    :expressions: Expressions for each layer in a tree policy.
-    :tree: Tree of operators and leaves.
-    :key: Random key.
-    :leaf_sd: Standard deviation for sampling constants.
-    :returns: Mutated tree.
+    Returns: The index of the leaf node that will be replaced with a new leaf
     """
-    key, new_key = jrandom.split(key)
-    new_operator = expressions.operators[jrandom.choice(new_key, a = jnp.arange(len(expressions.operators)), shape=(), p = expressions.operators_prob)]
-    if new_operator.arity == 1:
-        new_tree = [new_operator, tree]
-    else:
-        new_key1, new_key2 = jrandom.split(key, 2)
-        tree_position = jrandom.randint(new_key1, shape=(), minval=0, maxval=2)
-        #Sample a leaf for the other child of the operator
-        other_leaf = initialization.sample_leaf(new_key2, expressions, leaf_sd)
 
-        new_tree = [new_operator, tree, other_leaf] if (tree_position == 0) else [new_operator, other_leaf, tree]
-    return eqx.tree_at(lambda t: t, tree, new_tree)
+    tree, key, _, _, variable_array, variable_indices = carry
+    key, select_key, sample_key, variable_key = jr.split(key, 4)
+    node_ids = tree[:,0]
+    is_leaf = (node_ids == 1) | jnp.isin(node_ids, variable_indices)
+    mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_leaf*1.) #Sample node to be mutated
+    new_leaf = jax.lax.select(jr.uniform(sample_key)<0.5, 1, jr.choice(variable_key, variable_indices, shape=(), p=variable_array)) #Sample coefficient or variable
 
-def mutate_leaf(expressions: Expression, tree: list, key: PRNGKey, leaf_sd: float) -> list:
-    """Change value of a leaf. Leaf can stay the same type of change to a different leaf type.
+    return (tree, key, mutate_idx, new_leaf, variable_array, variable_indices)
 
-    :param expressions: Expressions for each layer in a tree policy.
-    :param tree: Tree of operators and leaves.
-    :param key: Random key.
-    :param leaf_sd: Standard deviation for sampling constants.
-    :returns: Mutated tree.
+def check_equal_leaves(carry: Tuple[Array, PRNGKey, int, int, float, Array]) -> bool:
     """
-    nodes = jax.tree_util.tree_leaves(tree)
-    flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
-    leaf_indices = jnp.ravel(jnp.argwhere(jnp.array([node not in expressions.operators for node in nodes])))
+    Checks that the old and new leaf node are different
+    
+    :param tree
+    :param key
+    :param mutate_idx: Index of the node that is mutated
+    :param new_leaf: Value of the new leaf node
 
-    key, new_key = jrandom.split(key)
-    index = jrandom.choice(new_key, leaf_indices)
-    new_leaf = [nodes[index]]
-    while new_leaf == [nodes[index]]:
-        key, new_key1, new_key2 = jrandom.split(key, 3)
-        index = jrandom.choice(new_key1, leaf_indices)
-        new_leaf = initialization.sample_leaf(new_key2, expressions, sd=leaf_sd)
-
-    path = flat_tree_and_path[index][0][:-1]
-    return eqx.tree_at(lambda t: key_loc(t, path), tree, new_leaf)
-
-def mutate_constant(tree: list, key: PRNGKey, leaf_sd: float) -> list:
-    """Change the value of a constant leaf. The value is sampled close to the old value.
-
-    :param tree: Tree of operators and leaves.
-    :param key: Random key.
-    :param leaf_sd: Standard deviation for sampling constants.
-    :returns: Mutated tree.
+    Returns: Whether the old and new leaf are different
     """
-    nodes = jax.tree_util.tree_leaves(tree)
-    constant_indicies = jnp.ravel(jnp.argwhere(jnp.array([isinstance(node, jax.numpy.ndarray) for node in nodes])))
 
-    key, new_key = jrandom.split(key)
-    index = jrandom.choice(new_key, constant_indicies)
-    flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
-    value = flat_tree_and_path[index][1]
-    path = flat_tree_and_path[index][0]
-    #Sample with old value as mean
-    key, new_key = jrandom.split(key)
-    return eqx.tree_at(lambda t: key_loc(t, path), tree, value+leaf_sd*jrandom.normal(new_key))
+    tree, key, mutate_idx, new_leaf, _, _ = carry
 
-def delete_operator(expressions: Expression, tree: list, key: PRNGKey, leaf_sd: float) -> list:
-    """Replace an operator with a new leaf.
+    return (tree[mutate_idx, 0] == new_leaf) & (new_leaf != 1) #Nodes have to be different unless they are coefficients
 
-    :param expressions: Expressions for each layer in a tree policy.
-    :param tree: Tree of operators and leaves.
-    :param key: Random key.
-    :param leaf_sd: Standard deviation for sampling constants.
-    :returns: Mutated tree.
+def check_invalid_operator_node(carry: Tuple[Array, PRNGKey, int, int, int, Array, Array]) -> bool:
     """
-    key, new_key = jrandom.split(key)
-    new_leaf = initialization.sample_leaf(new_key, expressions, sd=leaf_sd)
-    nodes = jax.tree_util.tree_leaves(tree)
-    operator_indicies = jnp.ravel(jnp.argwhere(jnp.array([node in expressions.operators for node in nodes])))
-    flat_tree_and_path = jax.tree_util.tree_leaves_with_path(tree)
+    Checks that the old and new operator node are different and that the tree does not exceed the maximum size after sampling a new subtree
+    
+    :param tree
+    :param key
+    :param mutate_idx: Index of the node that is mutated
+    :param new_operator: Value of the new operator node
+    :param slots: The number of operands of the operators
 
-    key, new_key = jrandom.split(key)
-    index = jrandom.choice(new_key, operator_indicies)
-    path = flat_tree_and_path[index][0][:-1]
-
-    return eqx.tree_at(lambda t: key_loc(t, path), tree, new_leaf)
-
-def mutate_tree(mutation_probabilities: Array, expressions: Expression, tree: list, key: PRNGKey, max_init_depth: int, leaf_sd: float) -> list:
-    """Applies on of the mutation functions to a tree.
-
-    :param mutation_probabilities: Probabilities of the mutation funcitons. 
-    :param expressions: Expressions for each layer in a tree policy.
-    :param tree: Tree of operators and leaves.
-    :param key: Random key.
-    :param max_init_depth: Highest depth of a tree at initialization
-    :param leaf_sd: Standard deviation for sampling constants.
-    :returns: Mutated tree.
+    Returns: Whether the old and new operator are different and a valid subtree can be sampled
     """
-    _mutation_probabilities = mutation_probabilities.copy()
 
-    if len(tree)==1: #Tree does not contain operators, so exclude mutations that require operators
-        _mutation_probabilities["mutate_operator"] = 0
-        _mutation_probabilities["delete_operator"] = 0
-        _mutation_probabilities["insert_operator"] = 0
-    if sum([isinstance(node, jax.numpy.ndarray) for node in jax.tree_util.tree_leaves(tree)]) == 0: #Tree does not contain constants, so exclude mutations that require constants
-        _mutation_probabilities["mutate_constant"] = 0
+    tree, _, mutate_idx, new_operator, slots, _, _ = carry
+    _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, find_end_idx, (tree, 1, mutate_idx))
 
-    key, new_key1, new_key2 = jrandom.split(key, 3)
-    types, probabilities = list(_mutation_probabilities.keys()), list(_mutation_probabilities.values())
-    mutation_type = types[jrandom.choice(new_key1, len(types), shape=(), p=jnp.array(probabilities))] #Sample which mutation function will be applied to the tree
-    if mutation_type=="mutate_operator":
-        new_tree = mutate_operator(expressions, tree, new_key2, leaf_sd)
-    elif mutation_type=="delete_operator":
-        new_tree = delete_operator(expressions, tree, new_key2, leaf_sd)
-    elif mutation_type=="prepend_operator":
-        new_tree = prepend_operator(expressions, tree, new_key2, leaf_sd)
-    elif mutation_type=="insert_operator":
-        new_tree = insert_operator(expressions, tree, new_key2, leaf_sd)
-    elif mutation_type=="mutate_constant":
-        new_tree = mutate_constant(tree, new_key2, leaf_sd)
-    elif mutation_type=="mutate_leaf":
-        new_tree = mutate_leaf(expressions, tree, new_key2, leaf_sd)
-    elif mutation_type=="sample_subtree":
-        new_tree = initialization.grow_node(new_key2, expressions, depth=max_init_depth, leaf_sd=leaf_sd)
-    elif mutation_type=="add_subtree":
-        new_tree = add_subtree(expressions, tree, new_key2, leaf_sd)        
-    return new_tree
+    subtree_size = mutate_idx - end_idx
 
-def mutate_trees(parent: TreePolicy, layer_sizes: Array, key: PRNGKey, reproduction_probability: float, mutation_probabilities: Array, expressions: list, max_init_depth: int, leaf_sd: float) -> TreePolicy:
-    """Mutate trees in tree policy.
+    empty_nodes = jnp.sum(tree[:,0]==0)
+    new_tree_size = jax.lax.select(slots[new_operator] == 2, 7, 8) #The maximum size of the subtree given the number of operands of the new operator
 
-    :param parent: Tree policy to be mutated.
-    :param layer_sizes: Size of each layer in a tree policy.
-    :param key: Random key.
-    :param reproduction_probability: Probability of a tree to be adapted in a tree policy.
-    :param mutation_probabilities: Probabilities of the mutation functions.
-    :param expressions: Expressions for each layer in a tree policy.
-    :param max_init_depth: Highest depth of a tree during initialization.  
-    :param leaf_sd: Standard deviation for sampling constants.
-    :returns: Mutated tree policy.
+    #Nodes have to be different and the new tree size should be smaller than the number of empty nodes and removed subtree size
+    return (tree[mutate_idx, 0] == new_operator) | (empty_nodes + subtree_size < new_tree_size)
+
+def sample_operator_node(carry: Tuple[Array, PRNGKey, int, int, int, Array, Array]) -> Tuple[Array, PRNGKey, int, int, int, Array, Array]:
     """
-    key, new_key = jrandom.split(key)
-    mutate_bool = jrandom.bernoulli(new_key, p = reproduction_probability, shape=(jnp.sum(layer_sizes),))
-    while jnp.sum(mutate_bool)==0: #Make sure that at least one tree is mutated
-        key, new_key = jrandom.split(key)
-        mutate_bool = jrandom.bernoulli(new_key, p = reproduction_probability, shape=(jnp.sum(layer_sizes),))
+    Samples an operator node to be replaced in the tree and a new operator node
+    
+    :param tree
+    :param key
+    :param slots: The valid variables for this tree
+    :param operator_indices: The indices of the available operator nodes
+    :param operator_probabilities: The probabilities of the operator nodes
 
-    child = parent
-    for i in range(layer_sizes.shape[0]):
-        for j in range(layer_sizes[i]):
-            if i > 0:
-                index = jnp.sum(layer_sizes[:i]) + j
-            else:
-                index = j
+    Returns: The index of the operator node that will be replaced with a new operator
+    """
 
-            if mutate_bool[index]:
-                key, new_key = jrandom.split(key)
-                new_tree = mutate_tree(mutation_probabilities, expressions[i], parent()[i][j], key, max_init_depth, leaf_sd)
-                child = eqx.tree_at(lambda t: t()[i][j], child, new_tree)
+    tree, key, _, _, slots, operator_indices, operator_probabilities = carry
+    key, select_key, sample_key = jr.split(key, 3)
+
+    node_ids = tree[:,0]
+    is_operator = jnp.isin(node_ids, operator_indices)
+    mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_operator*1.) #Sample node to be mutated
+    new_operator = jr.choice(sample_key, a=operator_indices, shape=(), p=operator_probabilities) #Sample operator
+
+    return (tree, key, mutate_idx, new_operator, slots, operator_indices, operator_probabilities)
+
+def add_subtree(tree: Array, 
+                key: PRNGKey, 
+                variable_array: Array, 
+                args: Tuple) -> Array:
+    """
+    Replaces a leaf node with a random subtree
+    
+    :param tree
+    :param key
+    :param variable_array: The valid variables for this tree
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Mutated tree
+    """
+
+    (sample_tree, max_nodes, max_init_depth, variable_indices, operator_indices, operator_probabilities, slots, coefficient_sd) = args
+    tree_indices = jnp.tile(jnp.arange(max_nodes)[:,None], reps=(1,4))
+    select_key, sample_key = jr.split(key, 2)
+    node_ids = tree[:,0]
+    is_leaf = (node_ids == 1) | jnp.isin(node_ids, variable_indices)
+    mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_leaf*1.) #Sample node to be mutated
+
+    subtree = sample_tree(sample_key, 2, variable_array) #Sample new subtree
+    subtree_size = jnp.sum(subtree[:,0]!=0)
+
+    remaining_size = mutate_idx - jnp.sum(tree[:,0]==0) #Size of the subtree that should be preserved in the tree
+
+    child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (max_nodes, 1))
+    child = jnp.where(tree_indices > mutate_idx, tree, child) #Insert nodes before the mutation index in the new tree
+
+    rolled_tree = jnp.roll(tree, -subtree_size + 1, axis=0) #Align position of the remaining nodes with the new tree
+    child = jnp.where((tree_indices <= mutate_idx - subtree_size) & (tree_indices > mutate_idx - subtree_size - remaining_size), rolled_tree, child) #Insert nodes after the subtree in the new tree
+    child = child.at[:,1:3].set(jnp.where((child[:,1:3] < (mutate_idx)) & (child[:,1:3] > -1), child[:,1:3] - (subtree_size - 1), child[:,1:3])) #Update index references
+
+    subtree = jnp.roll(subtree, -(max_nodes - mutate_idx - 1), axis=0) #Align position of the subtree with the new tree
+    subtree = subtree.at[:,1:3].set(jnp.where(subtree[:,1:3] > -1, subtree[:,1:3] + (mutate_idx - max_nodes + 1), -1)) #Insert subtree in the new tree
+    child = jnp.where((tree_indices <= mutate_idx) & (tree_indices > mutate_idx - subtree_size), subtree, child) #Update index references in subtree
+
     return child
+
+def mutate_leaf(tree: Array, 
+                key: PRNGKey, 
+                variable_array: Array, 
+                args: Tuple) -> Array:
+    """
+    Replaces a leaf node with a different leaf node
+    
+    :param tree
+    :param key
+    :param variable_array: The valid variables for this tree
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Mutated tree
+    """
+
+    (sample_tree, max_nodes, max_init_depth, variable_indices, operator_indices, operator_probabilities, slots, coefficient_sd) = args
+    select_key, sample_key, coefficient_key, variable_key = jr.split(key, 4)
+    node_ids = tree[:,0]
+    is_leaf = (node_ids == 1) | jnp.isin(node_ids, variable_indices)
+    mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_leaf*1.) #Sample node to be mutated
+
+    new_leaf = jax.lax.select(jr.uniform(sample_key)<0.5, 1, jr.choice(variable_key, variable_indices, shape=(), p=variable_array)) #Sample coefficient or variable
+
+    #Check that the new leaf is different from the old leaf
+    _, _, mutate_idx, new_leaf, _, _ = jax.lax.while_loop(check_equal_leaves, sample_leaf_node, (tree, jr.fold_in(key, 0), mutate_idx, new_leaf, variable_array, variable_indices))
+
+    coefficient = jr.normal(coefficient_key)*coefficient_sd
+
+    child = tree.at[mutate_idx, 0].set(new_leaf)
+    child = jax.lax.select(new_leaf==1, child.at[mutate_idx, 3].set(coefficient), child.at[mutate_idx, 3].set(0)) #Set coefficient value
+
+    return child
+
+def replace_with_one_subtree(tree: Array, 
+                             key: PRNGKey, 
+                             mutate_idx: int, 
+                             operator: int, 
+                             variable_array: Array,
+                             args: Tuple) -> Array:
+    """
+    Replaces node with a operator node with one operand
+    
+    :param tree
+    :param key
+    :param mutate_idx: Index of the node that is mutated
+    :param operator: Operator node that is inserted
+    :param variable_array: The valid variables for this tree
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Mutated tree
+    """
+
+    (sample_tree, max_nodes, max_init_depth, variable_indices, operator_indices, operator_probabilities, slots, coefficient_sd) = args
+
+    tree_indices = jnp.tile(jnp.arange(max_nodes)[:,None], reps=(1,4))
+    _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, find_end_idx, (tree, 1, mutate_idx))
+
+    remaining_size = end_idx - jnp.sum(tree[:,0]==0) + 1 #Size of the subtree that should be preserved in the tree
+
+    subtree = sample_tree(key, 2, variable_array) #Sample new subtree
+    subtree_size = jnp.sum(subtree[:,0]!=0)
+
+    child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (max_nodes, 1))
+
+    child = jnp.where(tree_indices >= mutate_idx, tree, child) #Insert nodes before the mutation index in the new tree
+
+    rolled_tree = jnp.roll(tree, (mutate_idx - end_idx - subtree_size - 1), axis=0) #Align position of the remaining nodes with the new tree
+    child = jnp.where((tree_indices < mutate_idx - subtree_size) & (tree_indices >= mutate_idx - subtree_size - remaining_size), rolled_tree, child) #Insert nodes after the subtree in the new tree
+
+    child = child.at[mutate_idx, 0].set(operator)
+    child = child.at[mutate_idx, 2].set(-1) #Remove index reference to second operand
+
+    child = child.at[:,1:3].set(jnp.where((child[:,1:3] <= (end_idx)) & (child[:,1:3] > -1), child[:,1:3] + (mutate_idx - end_idx - subtree_size - 1), child[:,1:3])) #Update index references
+
+    subtree = jnp.roll(subtree, -(max_nodes - mutate_idx), axis=0) #Align position of the subtree with the new tree
+    subtree = subtree.at[:,1:3].set(jnp.where(subtree[:,1:3] > -1, subtree[:,1:3] + (mutate_idx - max_nodes), -1)) #Update index references in subtree
+    child = jnp.where((tree_indices < mutate_idx) & (tree_indices > mutate_idx - subtree_size - 1), subtree, child) #Insert subtree in the new tree
+
+    return child
+
+def replace_with_two_subtrees(tree: Array, 
+                              key: PRNGKey, 
+                              mutate_idx: int, 
+                              operator: int, 
+                              variable_array: Array, 
+                              args: Tuple) -> Array:
+    """
+    Replaces node with a operator node with two operands
+    
+    :param tree
+    :param key
+    :param mutate_idx: Index of the node that is mutated
+    :param operator: Operator node that is inserted
+    :param variable_array: The valid variables for this tree
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Mutated tree
+    """
+    (sample_tree, max_nodes, max_init_depth, variable_indices, operator_indices, operator_probabilities, slots, coefficient_sd) = args
+    tree_indices = jnp.tile(jnp.arange(max_nodes)[:,None], reps=(1,4))
+    key1, key2 = jr.split(key)
+    _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, find_end_idx, (tree, 1, mutate_idx))
+
+    remaining_size = end_idx - jnp.sum(tree[:,0]==0) + 1 #Size of the subtree that should be preserved in the tree
+
+    #Sample new subtrees
+    subtree1 = sample_tree(key1, 1, variable_array)
+    subtree1_size = jnp.sum(subtree1[:,0]!=0)
+    subtree2 = sample_tree(key2, 1, variable_array)
+    subtree2_size = jnp.sum(subtree2[:,0]!=0)
+
+    child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (max_nodes, 1))
+    child = jnp.where(tree_indices >= mutate_idx, tree, child) #Insert nodes before the mutation index in the new tree
+
+    rolled_tree = jnp.roll(tree, (mutate_idx - end_idx - subtree1_size - subtree2_size - 1), axis=0) #Align position of the remaining nodes with the new tree
+    child = jnp.where((tree_indices < mutate_idx - subtree1_size - subtree2_size) & (tree_indices >= mutate_idx - subtree1_size - subtree2_size - remaining_size), rolled_tree, child) #Insert nodes after the subtrees in the new tree
+
+    child = child.at[:,1:3].set(jnp.where((child[:,1:3] <= (end_idx)) & (child[:,1:3] > -1), child[:,1:3] + (mutate_idx - end_idx - subtree1_size - subtree2_size - 1), child[:,1:3])) #Update index references
+
+    child = child.at[mutate_idx, 0].set(operator)
+    child = child.at[mutate_idx, 1].set(mutate_idx - 1)
+    child = child.at[mutate_idx, 2].set(mutate_idx - subtree1_size - 1)
+
+    subtree1 = jnp.roll(subtree1, -(max_nodes - mutate_idx), axis=0) #Align position of the first subtree with the new tree
+    subtree1 = subtree1.at[:,1:3].set(jnp.where(subtree1[:,1:3] > -1, subtree1[:,1:3] + (mutate_idx - max_nodes), -1)) #Update index references in subtree
+    child = jnp.where((tree_indices < mutate_idx) & (tree_indices > mutate_idx - subtree1_size - 1), subtree1, child) #Insert subtree in the new tree
+
+    subtree2 = jnp.roll(subtree2, -(max_nodes - mutate_idx + subtree1_size), axis=0) #Align position of the second subtree with the new tree
+    subtree2 = subtree2.at[:,1:3].set(jnp.where(subtree2[:,1:3] > -1, subtree2[:,1:3] + (mutate_idx - subtree1_size - max_nodes), -1)) #Update index references in subtree
+    child = jnp.where((tree_indices < mutate_idx - subtree1_size) & (tree_indices > mutate_idx - subtree1_size - subtree2_size - 1), subtree2, child) #Insert subtree in the new tree
+
+    return child
+
+def mutate_operator(tree: Array, 
+                    key: PRNGKey, 
+                    variable_array: Array, 
+                    args: Tuple) -> Array:
+    """
+    Replaces an operator node with a different operator node. The arity of the operator might change, therefore new subtrees may be sampled
+    
+    :param tree
+    :param key
+    :param variable_array: The valid variables for this tree
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Mutated tree
+    """
+
+    (sample_tree, max_nodes, max_init_depth, variable_indices, operator_indices, operator_probabilities, slots, coefficient_sd) = args
+    select_key, sample_key, subtree_key = jr.split(key, 3)
+    node_ids = tree[:,0]
+    is_operator = jnp.isin(node_ids, operator_indices)
+    mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_operator*1.) #Sample node to be mutated
+
+    new_operator = jr.choice(sample_key, a=operator_indices, shape=(), p=operator_probabilities) #Sample new operator
+
+    #Check that the new operator is different from the old operator
+    _, _, mutate_idx, new_operator, _, _, _ = jax.lax.while_loop(check_invalid_operator_node, sample_operator_node, (tree, 
+                                                                                                                     jr.fold_in(key, 0),
+                                                                                                                     mutate_idx, 
+                                                                                                                     new_operator, 
+                                                                                                                     slots, 
+                                                                                                                     operator_indices, 
+                                                                                                                     operator_probabilities))
+
+    current_slots = slots[node_ids[mutate_idx].astype(int)]
+    new_slots = slots[new_operator]
+
+    #Insert new operator and sample subtrees if necessary
+    child = jax.lax.select(current_slots==2, 
+                            jax.lax.select(new_slots==2, tree.at[mutate_idx, 0].set(new_operator), replace_with_one_subtree(tree, subtree_key, mutate_idx, new_operator, variable_array, args)), 
+                            jax.lax.select(new_slots==2, replace_with_two_subtrees(tree, subtree_key, mutate_idx, new_operator, variable_array, args), tree.at[mutate_idx, 0].set(new_operator)))
+
+    return child
+
+def delete_operator(tree: Array, 
+                    key: PRNGKey, 
+                    variable_array: Array, 
+                    args: Tuple) -> Array:
+    """
+    Replaces an operator and operands with a leaf node
+    
+    :param tree
+    :param key
+    :param variable_array: The valid variables for this tree
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Mutated tree
+    """
+
+    (sample_tree, max_nodes, max_init_depth, variable_indices, operator_indices, operator_probabilities, slots, coefficient_sd) = args
+    tree_indices = jnp.tile(jnp.arange(max_nodes)[:,None], reps=(1,4))
+    select_key, sample_key, coefficient_key, variable_key = jr.split(key, 4)
+    node_ids = tree[:,0]
+    is_operator = jnp.isin(node_ids, operator_indices)
+    is_operator = is_operator.at[-1].set(False)
+    delete_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_operator*1.) #Sample node to be mutated
+
+    _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, find_end_idx, (tree, 1, delete_idx))
+
+    remaining_size = end_idx - jnp.sum(tree[:,0]==0) + 1 #Size of the subtree that should be preserved in the tree
+
+    coefficient = jr.normal(coefficient_key)*coefficient_sd
+    new_leaf = jax.lax.select(jr.uniform(sample_key)<0.5, 1, jr.choice(variable_key, variable_indices, shape=(), p=variable_array)) #Sample coefficient or variable
+
+    child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (max_nodes, 1))
+    child = jnp.where(tree_indices > delete_idx, tree, child) #Insert nodes before the mutation index in the new tree
+
+    rolled_tree = jnp.roll(tree, delete_idx - end_idx - 1, axis=0) #Align position of the remaining nodes with the new tree
+    child = jnp.where((tree_indices < delete_idx) & (tree_indices >= delete_idx - remaining_size), rolled_tree, child) #Insert nodes after the subtrees in the new tree
+    child = child.at[:,1:3].set(jnp.where((child[:,1:3] <= (delete_idx - 1)) & (child[:,1:3] > -1), child[:,1:3] + (delete_idx - end_idx - 1), child[:,1:3])) #Update index references
+
+    child = child.at[delete_idx, 0].set(new_leaf) #Insert leaf node
+    child = jax.lax.select(new_leaf==1, child.at[delete_idx, 3].set(coefficient), child.at[delete_idx, 3].set(0)) #Set coefficient value
+
+    return child
+
+def prepend_operator(tree: Array, 
+                     key: PRNGKey, 
+                     variable_array: Array, 
+                     args: Tuple) -> Array:
+    """
+    Adds an operator node before root node
+    
+    :param tree
+    :param key
+    :param variable_array: The valid variables for this tree
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Mutated tree
+    """
+
+    (sample_tree, max_nodes, max_init_depth, variable_indices, operator_indices, operator_probabilities, slots, coefficient_sd) = args
+    tree_indices = jnp.tile(jnp.arange(max_nodes)[:,None], reps=(1,4))
+    sample_key, subtree_key, side_key = jr.split(key, 3)
+    new_operator = jr.choice(sample_key, a=operator_indices, shape=(), p=operator_probabilities) #Sample new operator
+    new_slots = slots[new_operator]
+
+    subtree = sample_tree(subtree_key, 2, variable_array) #Sample new subtree
+    subtree_size = jnp.sum(subtree[:,0]!=0)
+    tree_size = jnp.sum(tree[:,0]!=0)
+
+    second_branch = jr.bernoulli(side_key) #Sample if the old tree is the first or second operand
+
+    child = jnp.roll(tree, -1 - (new_slots - 1) * second_branch*subtree_size, axis=0) #Insert old tree in the new tree
+    child = child.at[:,1:3].set(jnp.where(child[:,1:3] > -1, child[:,1:3] - 1 - (new_slots - 1) * second_branch*subtree_size, child[:,1:3])) #Update index references
+
+    rolled_subtree = jnp.roll(subtree, -1 - (1-second_branch) * tree_size, axis=0) #Align position of the new subtree with the new tree
+    rolled_subtree = rolled_subtree.at[:,1:3].set(jnp.where(rolled_subtree[:,1:3] > -1, rolled_subtree[:,1:3] - 1 - (1-second_branch)*tree_size, rolled_subtree[:,1:3])) #Update index references in subtree
+
+    #Insert subtree in first or second branch of new tree
+    child_2_branches = jax.lax.select(second_branch, 
+                                      jnp.where((tree_indices < max_nodes - 1) & (tree_indices >= max_nodes - subtree_size - 1), rolled_subtree, child), 
+                                      jnp.where((tree_indices < max_nodes - tree_size - 1) & (tree_indices >= max_nodes - tree_size - subtree_size - 1), rolled_subtree, child))
+
+    child = jax.lax.select(new_slots==2, child_2_branches, child) #Select tree with one or two operands
+    child = child.at[-1, 0].set(new_operator)
+    child = child.at[-1, 1].set(max_nodes - 2)
+    child = child.at[-1, 2].set(jax.lax.select(new_slots==2, max_nodes - jax.lax.select(second_branch, subtree_size, tree_size) - 2, -1))
+
+    return child
+
+def insert_operator(tree: Array, 
+                    key: PRNGKey, 
+                    variable_array: Array, 
+                    args: Tuple) -> Array:
+    """
+    Inserts an operator node above a random node
+    
+    :param tree
+    :param key
+    :param variable_array: The valid variables for this tree
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Mutated tree
+    """
+
+    (sample_tree, max_nodes, max_init_depth, variable_indices, operator_indices, operator_probabilities, slots, coefficient_sd) = args
+    tree_indices = jnp.tile(jnp.arange(max_nodes)[:,None], reps=(1,4))
+    select_key, sample_key, subtree_key, side_key = jr.split(key, 4)
+    node_ids = tree[:,0]
+    is_operator = jnp.isin(node_ids, operator_indices)
+    is_operator = is_operator.at[-1].set(False) #Root node cannot be selected
+    mutate_idx = jr.choice(select_key, jnp.arange(tree.shape[0]), p = is_operator*1.) #Sample node to be mutated
+
+    _, _, end_idx = jax.lax.while_loop(lambda carry: carry[1]>0, find_end_idx, (tree, 1, mutate_idx))
+
+    new_operator = jr.choice(sample_key, a=operator_indices, shape=(), p=operator_probabilities) #Sample new operator
+    new_slots = slots[new_operator]
+
+    subtree = sample_tree(subtree_key, 2, variable_array) #Sample new subtree
+    subtree_size = jnp.sum(subtree[:,0]!=0)
+    tree_size = mutate_idx - end_idx
+
+    second_branch = jr.bernoulli(side_key) #Sample if the old subtree is the first or second operand
+
+    child = jnp.tile(jnp.array([0.0,-1.0,-1.0,0.0]), (max_nodes, 1))
+    child = jnp.where(tree_indices > mutate_idx, tree, child) #Insert nodes before the mutation index in the new tree
+    child = jnp.where(tree_indices < end_idx - (new_slots - 1) * subtree_size, jnp.roll(tree, -(new_slots - 1) * subtree_size - 1, axis=0), child) #Insert nodes after the subtree in the new tree
+    child = child.at[:,1:3].set(jnp.where((child[:,1:3] <= (end_idx)) & (child[:,1:3] > -1), child[:,1:3] - (new_slots - 1) * subtree_size - 1, child[:,1:3])) #Update index references
+
+    rolled_tree = jnp.roll(tree, - (new_slots - 1) * second_branch * subtree_size - 1, axis=0) #Align position of the old subtree with the new tree
+    rolled_tree = rolled_tree.at[:,1:3].set(jnp.where(rolled_tree[:,1:3] > -1, rolled_tree[:,1:3] - 1 - (new_slots - 1) * second_branch*subtree_size, rolled_tree[:,1:3])) #Update index references in old subtree
+
+    rolled_subtree = jnp.roll(subtree, mutate_idx - max_nodes - (1-second_branch) * tree_size, axis=0) #Align position of the new subtree with the new tree
+    rolled_subtree = rolled_subtree.at[:,1:3].set(jnp.where(rolled_subtree[:,1:3] > -1, rolled_subtree[:,1:3] - (max_nodes - mutate_idx) - (1-second_branch)*tree_size, rolled_subtree[:,1:3])) #Update index references in new subtree
+
+    lower_tree = jax.lax.select(second_branch, jnp.where(tree_indices <= mutate_idx - subtree_size - 1, rolled_tree, rolled_subtree), 
+                            jnp.where(tree_indices <= end_idx - 1, rolled_subtree, rolled_tree)) #Place first and second subtree
+    
+    child_2_branches = jnp.where((tree_indices <= mutate_idx - 1) & (tree_indices > mutate_idx - subtree_size - tree_size - 1), lower_tree, child) #Insert subtrees in new tree
+
+    child_1_branch = jnp.where((tree_indices <= mutate_idx - 1) & (tree_indices >= mutate_idx - tree_size), rolled_tree, child) #Insert old subtree in new tree
+    
+    child = jax.lax.select(new_slots==2, child_2_branches, child_1_branch) #Select tree with one or two operands
+    child = child.at[mutate_idx, 0].set(new_operator)
+    child = child.at[mutate_idx, 1].set(mutate_idx - 1)
+    child = child.at[mutate_idx, 2].set(jax.lax.select(new_slots==2, mutate_idx - jax.lax.select(second_branch, subtree_size, tree_size) - 1, -1))
+
+    return child
+
+def replace_tree(tree: Array, 
+                 key: PRNGKey, 
+                 variable_array: Array, 
+                 args: Tuple) -> Array:
+    """
+    Samples a new tree
+    
+    :param tree
+    :param key
+    :param variable_array: The valid variables for this tree
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Sampled tree
+    """
+    (sample_tree, max_nodes, max_init_depth, variable_indices, operator_indices, operator_probabilities, slots, coefficient_sd) = args
+    return sample_tree(key, max_init_depth, variable_array)
+
+def mutate_tree(tree: Array, 
+                key: PRNGKey, 
+                mutate_function: int, 
+                variable_array: Array, 
+                partial_mutate_functions: list[Callable]) -> Array:
+    """
+    Apply mutation to tree
+    
+    :param tree
+    :param key
+    :param mutate_function: Indicates which mutation should be applied
+    :param variable_array: The valid variables for this tree
+    :partial_mutate_functions: Mutation functions that can be applied
+
+    Returns: Mutated tree
+    """
+    return jax.lax.switch(mutate_function, partial_mutate_functions, tree, key, variable_array)
+
+def get_mutations(tree: Array, 
+                  key: PRNGKey) -> int:
+    """
+    Sample mutation function to apply to the tree
+    
+    :param tree
+    :param key
+
+    Returns: Index of mutation function
+    """
+        
+    mutation_probs = jnp.ones(len(MUTATE_FUNCTIONS))
+    mutation_probs = jax.lax.select(jnp.sum(tree[:,0]==0) < 8, jnp.array([0., 1., 1., 1., 0., 0., 1.]), mutation_probs) #Tree is too big to add more nodes
+    mutation_probs = jax.lax.select(jnp.sum(tree[:,0]!=0) <= 3, jnp.array([1., 1., 1., 0., 1., 0., 1.]), mutation_probs) #Tree does not have enough operators
+    mutation_probs = jax.lax.select(jnp.sum(tree[:,0]!=0) == 1, jnp.array([1., 1., 0., 0., 1., 0., 1.]), mutation_probs) #Tree does not have operators
+    
+    return jr.choice(key, jnp.arange(len(MUTATE_FUNCTIONS)), p=mutation_probs)
+
+#Define list with possible mutation functions
+MUTATE_FUNCTIONS = [add_subtree, mutate_leaf, mutate_operator, delete_operator, prepend_operator, insert_operator, replace_tree]
+
+def initialize_mutation_functions(args: Tuple) -> Callable:
+    """
+    Initializes the mutation functions with static arguments
+
+    :param args: Miscellaneous parameters required for mutation
+
+    Returns: Jittable mutation function
+    """
+
+    partial_mutate_functions = [partial(f, args=args) for f in MUTATE_FUNCTIONS] #Set args as static argument in mutation functions
+
+    def mutate_trees(trees: Array, 
+                     keys: PRNGKey, 
+                     reproduction_probability: float, 
+                     variable_array: Array) -> Array:
+        """
+        Mutates the trees in a candidate
+        
+        :param tree
+        :param key
+        :param reproduction_probability: Probability of a tree to be mutated
+        :param variable_array: The valid variables for this tree
+
+        Returns: Mutated candidate
+        """
+
+        #Sample the trees that will be mutated. At least one tree will be mutated
+        _, mutate_indices, _ = jax.lax.while_loop(lambda carry: jnp.sum(carry[1])==0, sample_indices, (keys[0], jnp.zeros(trees.shape[0]), reproduction_probability))
+        mutate_functions = jax.vmap(get_mutations)(trees, keys)
+
+        mutated_trees = jax.vmap(mutate_tree, in_axes=[0,0,0,0,None])(trees, keys, mutate_functions, variable_array, partial_mutate_functions)
+
+        #Only keep the new trees of the mutation indices
+        return jnp.where(mutate_indices[:,None,None] * jnp.ones_like(trees), mutated_trees, trees)
+    
+    return mutate_trees
