@@ -80,8 +80,8 @@ class HarmonicOscillator(EnvironmentBase):
         costs = jax.vmap(lambda _state, _u: (_state-x_d).T@self.Q@(_state-x_d) + (_u-u_d)@self.R@(_u-u_d))(state,control)
         return jnp.sum(costs)
     
-    def terminate_event(self, state, **kwargs):
-        return jnp.any(jnp.isnan(state.y))
+    def cond_fn_nan(self, t, y, args, **kwargs):
+        return jnp.where(jnp.any(jnp.isinf(y) +jnp.isnan(y)), -1.0, 1.0)
 
 class ChangingHarmonicOscillator(EnvironmentBase):
     def __init__(self, process_noise, obs_noise, n_obs = 2):
